@@ -429,10 +429,18 @@ if ($LASTEXITCODE -ne 0) { throw 'Application fixture restore failed.' }
 Add-Content -LiteralPath (Join-Path $projectPath 'Unsafe Input.cs') -Value 'class Broken { MissingType value; }'
 $incompleteSarif = Join-Path $scratch 'incomplete.sarif'
 $invalidProjectOutput = & $tool $project --sarif $incompleteSarif 2>&1
-if ($LASTEXITCODE -ne 2 -or -not ($invalidProjectOutput -match 'CS0246') -or
-    -not ($invalidProjectOutput -match 'Scan incomplete') -or
-    (Test-Path -LiteralPath $incompleteSarif)) {
-    throw 'CLI did not explain incomplete scanning of a project with compiler errors.'
+if ($LASTEXITCODE -ne 0 -or -not ($invalidProjectOutput -match 'CS0246') -or
+    -not ($invalidProjectOutput -match 'partial scan') -or
+    -not (Test-Path -LiteralPath $incompleteSarif)) {
+    throw 'CLI did not preserve partial scanning and SARIF for a project with compiler errors.'
+}
+$incompleteReport = Get-Content -LiteralPath $incompleteSarif -Raw | ConvertFrom-Json
+# The lowercase config introduced above also adds the Custom.Execute SQL sink.
+$expectedPartialIds = @($ids) + @('DNA0001')
+if (-not $incompleteReport.runs[0].invocations[0].executionSuccessful -or
+    $incompleteReport.runs[0].invocations[0].properties.'dotnetarium.coverage' -ne 'partial' -or
+    (Compare-Object ($expectedPartialIds | Sort-Object) (@($incompleteReport.runs[0].results | ForEach-Object ruleId) | Sort-Object))) {
+    throw 'Partial SARIF lost findings or omitted its coverage status.'
 }
 
 'Analyzer NuGet package and global tool scan .NET 8/10; custom JSON, relative SARIF, and compiler error checks passed.' | Write-Output

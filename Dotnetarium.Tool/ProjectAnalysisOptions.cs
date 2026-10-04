@@ -25,7 +25,13 @@ internal sealed class ProjectAnalysisOptions(AnalyzerConfigOptionsProvider origi
         using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not read project metadata.");
         var output = process.StandardOutput.ReadToEndAsync();
         var error = process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        try { await process.WaitForExitAsync(timeout.Token); }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            throw new InvalidOperationException($"Reading test-project metadata timed out for {projectPath}.");
+        }
         if (process.ExitCode != 0)
             throw new InvalidOperationException($"Could not read test-project metadata for {projectPath}: {await error}");
         return new ProjectAnalysisOptions(original, (await output).Trim());

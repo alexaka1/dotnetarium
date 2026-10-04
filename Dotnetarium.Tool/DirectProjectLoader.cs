@@ -1,0 +1,396 @@
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Xml.Linq;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Text;
+
+namespace Dotnetarium.Tool;
+
+// Experimental input reconstruction. This deliberately does not evaluate
+// MSBuild tasks, execute targets, restore packages, or run source generators.
+internal sealed class DirectProjectLoader(ScanReport report)
+{
+    private readonly Dictionary<string, List<ProjectSpec>> specs = new(ProjectLoader.PathComparer);
+    private readonly HashSet<string> visited = new(ProjectLoader.PathComparer);
+    private readonly List<string> packRoots = FindPackRoots();
+
+    internal async Task<ScanInputs> LoadAsync(string target)
+    {
+        var workspace = new AdhocWorkspace();
+        var inputs = new ScanInputs(workspace);
+        try
+        {
+            foreach (var path in ProjectLoader.FindProjects(target)) ReadProject(path);
+            var solution = workspace.CurrentSolution;
+            foreach (var spec in specs.Values.SelectMany(value => value))
+            {
+                var major = spec.Framework == "net8.0" ? 8 : 10;
+                var symbols = new HashSet<string>(StringComparer.Ordinal)
+                {
+                    "TRACE", "NET", "NETCOREAPP", $"NET{major}_0", $"NET{major}_0_OR_GREATER",
+                    "NETCOREAPP1_0_OR_GREATER", "NETCOREAPP1_1_OR_GREATER", "NETCOREAPP2_0_OR_GREATER",
+                    "NETCOREAPP2_1_OR_GREATER", "NETCOREAPP2_2_OR_GREATER", "NETCOREAPP3_0_OR_GREATER", "NETCOREAPP3_1_OR_GREATER"
+                };
+                for (var version = 5; version <= major; version++) symbols.Add($"NET{version}_0_OR_GREATER");
+                if (spec.Properties.GetValueOrDefault("Configuration", "Debug") == "Debug") symbols.Add("DEBUG");
+                foreach (var symbol in spec.Properties.GetValueOrDefault("DefineConstants", "").Split(';', StringSplitOptions.RemoveEmptyEntries))
+                    symbols.Add(symbol.Trim());
+                var language = major == 8 ? LanguageVersion.CSharp12 : LanguageVersion.CSharp14;
+                if (spec.Properties.TryGetValue("LangVersion", out var requested) && !LanguageVersionFacts.TryParse(requested, out language))
+                {
+                    Warn(spec.Path, "language-version", $"Unsupported LangVersion '{requested}'; using the framework default.");
+                    language = major == 8 ? LanguageVersion.CSharp12 : LanguageVersion.CSharp14;
+                }
+                var nullable = spec.Properties.GetValueOrDefault("Nullable", "disable") switch
+                {
+                    "enable" => NullableContextOptions.Enable,
+                    "annotations" => NullableContextOptions.Annotations,
+                    "warnings" => NullableContextOptions.Warnings,
+                    _ => NullableContextOptions.Disable
+                };
+                var output = spec.Properties.GetValueOrDefault("OutputType",
+                    spec.Sdk is "Microsoft.NET.Sdk.Web" or "Microsoft.NET.Sdk.BlazorWebAssembly" ? "Exe" : "Library");
+                var compilationOptions = new CSharpCompilationOptions(output.Equals("Exe", StringComparison.OrdinalIgnoreCase) ||
+                    output.Equals("WinExe", StringComparison.OrdinalIgnoreCase) ? OutputKind.ConsoleApplication : OutputKind.DynamicallyLinkedLibrary,
+                    nullableContextOptions: nullable, allowUnsafe: IsTrue(spec.Properties.GetValueOrDefault("AllowUnsafeBlocks")));
+                solution = solution.AddProject(ProjectInfo.Create(spec.Id, VersionStamp.Create(),
+                    $"{Path.GetFileNameWithoutExtension(spec.Path)} ({spec.Framework})",
+                    spec.Properties.GetValueOrDefault("AssemblyName", Path.GetFileNameWithoutExtension(spec.Path)), LanguageNames.CSharp,
+                    filePath: spec.Path, compilationOptions: compilationOptions,
+                    parseOptions: new CSharpParseOptions(language, preprocessorSymbols: symbols),
+                    metadataReferences: ReadReferences(spec)));
+                foreach (var source in ReadSources(spec))
+                    solution = solution.AddDocument(DocumentId.CreateNewId(spec.Id), Path.GetFileName(source),
+                        SourceText.From(await File.ReadAllTextAsync(source), Encoding.UTF8), filePath: source);
+                var usings = ReadUsings(spec);
+                if (usings.Length > 0)
+                    solution = solution.AddDocument(DocumentId.CreateNewId(spec.Id), "Dotnetarium.ImplicitUsings.g.cs",
+                        SourceText.From(usings, Encoding.UTF8), filePath: Path.Combine(spec.Root, "obj", "Dotnetarium.ImplicitUsings.g.cs"));
+                foreach (var config in FindAnalyzerConfigs(spec.Root))
+                    solution = solution.AddAnalyzerConfigDocument(DocumentId.CreateNewId(spec.Id), Path.GetFileName(config),
+                        SourceText.From(await File.ReadAllTextAsync(config)), filePath: config);
+                foreach (var item in spec.Items.Where(item => item.Name.LocalName == "AdditionalFiles"))
+                    foreach (var file in ExpandItem(spec.Root, Expand((string?)item.Attribute("Include") ?? "", spec.Properties)))
+                        solution = solution.AddAdditionalDocument(DocumentId.CreateNewId(spec.Id), Path.GetFileName(file),
+                            SourceText.From(await File.ReadAllTextAsync(file)), filePath: file);
+                inputs.TestProjectMetadata[spec.Id] = spec.Properties.GetValueOrDefault("IsTestProject", "false");
+            }
+            foreach (var spec in specs.Values.SelectMany(value => value))
+            {
+                foreach (var reference in spec.References)
+                {
+                    if (!specs.TryGetValue(reference, out var candidates) || candidates.Count == 0)
+                    {
+                        Warn(spec.Path, "project-reference", $"Project reference is unavailable: {reference}");
+                        continue;
+                    }
+                    var dependency = candidates.FirstOrDefault(candidate => candidate.Framework == spec.Framework) ??
+                        (spec.Framework == "net10.0" ? candidates.FirstOrDefault(candidate => candidate.Framework == "net8.0") : null);
+                    if (dependency == null)
+                    {
+                        Warn(spec.Path, "project-reference", $"No compatible framework for project reference: {reference}");
+                        continue;
+                    }
+                    try { solution = solution.AddProjectReference(spec.Id, new ProjectReference(dependency.Id)); }
+                    catch (InvalidOperationException error) { Warn(spec.Path, "project-reference", error.Message); }
+                }
+            }
+            if (!workspace.TryApplyChanges(solution)) throw new InvalidOperationException("Could not create the direct analysis workspace.");
+            return inputs;
+        }
+        catch { inputs.Dispose(); throw; }
+    }
+
+    private void ReadProject(string path)
+    {
+        if (!visited.Add(path)) return;
+        try
+        {
+            var root = Path.GetDirectoryName(path)!;
+            var project = XDocument.Load(path);
+            var sdk = (string?)project.Root?.Attribute("Sdk") ?? "";
+            if (sdk is not ("Microsoft.NET.Sdk" or "Microsoft.NET.Sdk.Web" or "Microsoft.NET.Sdk.Razor" or "Microsoft.NET.Sdk.BlazorWebAssembly"))
+                throw new NotSupportedException($"Unsupported SDK '{sdk}'. Direct loading supports conventional .NET SDK projects.");
+            var documents = new List<(string Path, XDocument Document)>();
+            var props = FindNearest(root, "Directory.Build.props");
+            if (props != null) documents.Add((props, XDocument.Load(props)));
+            documents.Add((path, project));
+            var properties = BaseProperties(root);
+            ReadProperties(documents, properties, path);
+            var frameworks = properties.GetValueOrDefault("TargetFramework", "");
+            if (frameworks.Length == 0) frameworks = properties.GetValueOrDefault("TargetFrameworks", "");
+            if (frameworks.Length == 0) throw new NotSupportedException("No statically readable TargetFramework/TargetFrameworks.");
+            specs[path] = [];
+            foreach (var framework in frameworks.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (framework is not ("net8.0" or "net10.0"))
+                {
+                    Warn(path, "target-framework", $"Unsupported direct-loader framework '{framework}'; skipped this framework.");
+                    report.SkippedProjects.Add($"{path} ({framework})");
+                    continue;
+                }
+                var evaluated = BaseProperties(root);
+                evaluated["TargetFramework"] = framework;
+                ReadProperties(documents, evaluated, path, preserveFramework: true);
+                var items = documents.SelectMany(document => document.Document.Root!.Elements())
+                    .Where(group => group.Name.LocalName == "ItemGroup" && Condition(group, evaluated, path))
+                    .SelectMany(group => group.Elements()).Where(item => Condition(item, evaluated, path)).ToArray();
+                foreach (var document in documents)
+                {
+                    foreach (var import in document.Document.Descendants().Where(element => element.Name.LocalName == "Import"))
+                        Warn(path, "import", $"Custom import was not evaluated: {(string?)import.Attribute("Project")}");
+                    if (document.Document.Descendants().Any(element => element.Name.LocalName == "Target"))
+                        Warn(path, "custom-targets", "Custom targets were not executed; generated inputs may be absent.");
+                }
+                if (FindNearest(root, "Directory.Build.targets") is { } targets)
+                    Warn(path, "import", $"Directory.Build.targets was not evaluated: {targets}");
+                var references = items.Where(item => item.Name.LocalName == "ProjectReference")
+                    .Select(item => Expand((string?)item.Attribute("Include") ?? "", evaluated))
+                    .Where(value => value.Length > 0).Select(value => Resolve(root, value)).ToArray();
+                specs[path].Add(new(ProjectId.CreateNewId(), path, root, framework, sdk, evaluated, items, references));
+            }
+            foreach (var reference in specs[path].SelectMany(spec => spec.References).Distinct()) ReadProject(reference);
+        }
+        catch (Exception error) when (error is IOException or System.Xml.XmlException or NotSupportedException or UnauthorizedAccessException)
+        {
+            Warn(path, "project-load", error.Message);
+            report.SkippedProjects.Add(path);
+        }
+    }
+
+    private static Dictionary<string, string> BaseProperties(string root) => new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["Configuration"] = "Debug", ["Platform"] = "AnyCPU",
+        ["DefineConstants"] = "",
+        ["TargetFramework"] = "",
+        ["MSBuildProjectDirectory"] = root, ["MSBuildThisFileDirectory"] = root + Path.DirectorySeparatorChar
+    };
+
+    private void ReadProperties(IEnumerable<(string Path, XDocument Document)> documents,
+        Dictionary<string, string> properties, string project, bool preserveFramework = false)
+    {
+        foreach (var document in documents)
+        {
+            properties["MSBuildThisFileDirectory"] = Path.GetDirectoryName(document.Path)! + Path.DirectorySeparatorChar;
+            foreach (var group in document.Document.Root!.Elements().Where(element => element.Name.LocalName == "PropertyGroup"))
+            {
+                if (!Condition(group, properties, project)) continue;
+                foreach (var property in group.Elements())
+                    if (!(preserveFramework && property.Name.LocalName == "TargetFramework") && Condition(property, properties, project))
+                    {
+                        var value = Expand(property.Value, properties);
+                        if (value.Contains("$(", StringComparison.Ordinal))
+                            Warn(project, "property", $"Unresolved property '{property.Name.LocalName}': {value}");
+                        properties[property.Name.LocalName] = value;
+                    }
+            }
+        }
+    }
+
+    private bool Condition(XElement element, Dictionary<string, string> properties, string project)
+    {
+        var condition = (string?)element.Attribute("Condition");
+        if (string.IsNullOrWhiteSpace(condition)) return true;
+        var expression = Expand(condition, properties).Trim();
+        var match = Regex.Match(expression, "^'([^']*)'\\s*(==|!=)\\s*'([^']*)'$");
+        if (match.Success && !expression.Contains("$(", StringComparison.Ordinal))
+        {
+            var equal = match.Groups[1].Value.Equals(match.Groups[3].Value, StringComparison.OrdinalIgnoreCase);
+            return match.Groups[2].Value == "==" ? equal : !equal;
+        }
+        if (bool.TryParse(expression, out var result)) return result;
+        Warn(project, "condition", $"Unsupported condition; skipped {element.Name.LocalName}: {condition}");
+        return false;
+    }
+
+    private List<MetadataReference> ReadReferences(ProjectSpec spec)
+    {
+        var paths = new HashSet<string>(ProjectLoader.PathComparer);
+        AddPack("Microsoft.NETCore.App.Ref", spec.Framework, spec.Path, paths);
+        if (spec.Sdk == "Microsoft.NET.Sdk.Web" || spec.Items.Any(item => item.Name.LocalName == "FrameworkReference" &&
+            (string?)item.Attribute("Include") == "Microsoft.AspNetCore.App"))
+            AddPack("Microsoft.AspNetCore.App.Ref", spec.Framework, spec.Path, paths);
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "FrameworkReference" &&
+            (string?)item.Attribute("Include") != "Microsoft.AspNetCore.App"))
+            Warn(spec.Path, "framework-reference", $"Unsupported framework reference: {(string?)item.Attribute("Include")}");
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "Reference"))
+        {
+            var hint = item.Elements().FirstOrDefault(element => element.Name.LocalName == "HintPath")?.Value;
+            if (hint != null && File.Exists(Resolve(spec.Root, Expand(hint, spec.Properties))))
+                paths.Add(Resolve(spec.Root, Expand(hint, spec.Properties)));
+            else Warn(spec.Path, "assembly-reference", $"Unresolved assembly reference: {(string?)item.Attribute("Include")}");
+        }
+        var assetsPath = Resolve(spec.Root, spec.Properties.GetValueOrDefault("ProjectAssetsFile",
+            Path.Combine(spec.Properties.GetValueOrDefault("BaseIntermediateOutputPath", "obj"), "project.assets.json")));
+        if (File.Exists(assetsPath))
+        {
+            try
+            {
+                using var assets = JsonDocument.Parse(File.ReadAllText(assetsPath));
+                var targets = assets.RootElement.GetProperty("targets");
+                if (targets.TryGetProperty(spec.Framework, out var target) ||
+                    targets.TryGetProperty($".NETCoreApp,Version=v{spec.Framework[3..]}", out target))
+                {
+                    var libraries = assets.RootElement.GetProperty("libraries");
+                    var folders = assets.RootElement.GetProperty("packageFolders").EnumerateObject().Select(folder => folder.Name).ToArray();
+                    foreach (var library in target.EnumerateObject())
+                    {
+                        if (new[] { "build", "buildTransitive", "buildMultiTargeting" }.Any(name => library.Value.TryGetProperty(name, out _)))
+                            Warn(spec.Path, "package-build-inputs", $"Package {library.Name} has build-time inputs that were not evaluated; source selection or compiler properties may differ.");
+                        if (!libraries.TryGetProperty(library.Name, out var metadata) ||
+                            metadata.GetProperty("type").GetString() != "package" ||
+                            !library.Value.TryGetProperty("compile", out var compile)) continue;
+                        var package = metadata.GetProperty("path").GetString()!;
+                        foreach (var asset in compile.EnumerateObject().Where(asset => asset.Name.EndsWith(".dll", StringComparison.OrdinalIgnoreCase)))
+                        {
+                            var file = folders.Select(folder => Resolve(folder, package + "/" + asset.Name)).FirstOrDefault(File.Exists);
+                            if (file != null) paths.Add(file);
+                            else Warn(spec.Path, "package-reference", $"Missing cached assembly: {library.Name}/{asset.Name}");
+                        }
+                    }
+                    if (assets.RootElement.TryGetProperty("logs", out var logs))
+                        foreach (var log in logs.EnumerateArray().Where(log => log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
+                            Warn(spec.Path, "package-restore", log.GetProperty("message").GetString()!);
+                }
+                else Warn(spec.Path, "package-assets", $"No assets target for {spec.Framework}; restore separately to improve coverage.");
+                // Generators may alter any compilation. Their assembly paths are
+                // evidence of missing inputs, not permission to execute them.
+                if (assets.RootElement.GetProperty("libraries").EnumerateObject().Any(library =>
+                    library.Value.TryGetProperty("files", out var files) && files.EnumerateArray().Any(file =>
+                        file.GetString()?.StartsWith("analyzers/", StringComparison.Ordinal) == true)))
+                    Warn(spec.Path, "generation", "Dependency analyzer/generator assemblies are present but were not executed.");
+            }
+            catch (Exception error) when (error is JsonException or KeyNotFoundException or InvalidOperationException)
+            { Warn(spec.Path, "package-assets", $"Invalid assets metadata: {error.Message}"); }
+        }
+        else if (spec.Items.Any(item => item.Name.LocalName == "PackageReference"))
+            Warn(spec.Path, "package-assets", "Restored package assets are absent; package API bindings may be unavailable. Restore separately to improve coverage.");
+        return paths.Select(path => (MetadataReference)MetadataReference.CreateFromFile(path)).ToList();
+    }
+
+    private void AddPack(string name, string framework, string project, HashSet<string> paths)
+    {
+        var major = framework == "net8.0" ? 8 : 10;
+        var candidates = packRoots.SelectMany(root => new[] { Path.Combine(root, name), Path.Combine(root, name.ToLowerInvariant()) })
+            .Distinct(StringComparer.Ordinal).Where(Directory.Exists)
+            .SelectMany(root => Directory.EnumerateDirectories(root))
+            .Select(path => (Path: path, Version: Version.TryParse(Path.GetFileName(path), out var version) ? version : null))
+            .Where(candidate => candidate.Version?.Major == major && candidate.Version.Minor == 0)
+            .OrderByDescending(candidate => candidate.Version);
+        var reference = candidates.Select(candidate => Path.Combine(candidate.Path, "ref", framework)).FirstOrDefault(Directory.Exists);
+        if (reference == null) Warn(project, "reference-pack", $"Missing {name} reference pack for {framework}; host runtime assemblies are not substituted.");
+        else foreach (var file in Directory.EnumerateFiles(reference, "*.dll")) paths.Add(file);
+    }
+
+    private IEnumerable<string> ReadSources(ProjectSpec spec)
+    {
+        var sources = new HashSet<string>(ProjectLoader.PathComparer);
+        if (!IsFalse(spec.Properties.GetValueOrDefault("EnableDefaultItems")) && !IsFalse(spec.Properties.GetValueOrDefault("EnableDefaultCompileItems")))
+            foreach (var file in EnumerateFiles(spec.Root).Where(file => file.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) && !IsOutputFile(spec.Root, file)))
+                sources.Add(file);
+        var defaultExcludes = spec.Properties.GetValueOrDefault("DefaultItemExcludes", "")
+            .Split(';', StringSplitOptions.RemoveEmptyEntries);
+        sources.RemoveWhere(file => defaultExcludes.Any(pattern => GlobMatches(Path.GetRelativePath(spec.Root, file), pattern)));
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "Compile" && item.Attribute("Include") != null))
+        {
+            var itemExcludes = Expand((string?)item.Attribute("Exclude") ?? "", spec.Properties).Split(';', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var file in ExpandItem(spec.Root, Expand(item.Attribute("Include")!.Value, spec.Properties)))
+                if (!itemExcludes.Any(pattern => GlobMatches(Path.GetRelativePath(spec.Root, file), pattern))) sources.Add(file);
+        }
+        var excludes = new List<string>();
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "Compile"))
+        {
+            if (item.Attribute("Remove") is { } exclusion) excludes.AddRange(Expand(exclusion.Value, spec.Properties).Split(';'));
+        }
+        sources.RemoveWhere(file => excludes.Any(pattern => GlobMatches(Path.GetRelativePath(spec.Root, file), pattern)));
+        if (EnumerateFiles(spec.Root).Any(file => !IsOutputFile(spec.Root, file) &&
+            Path.GetExtension(file).ToLowerInvariant() is ".razor" or ".cshtml" or ".proto"))
+            Warn(spec.Path, "generation", "Razor/Blazor/protobuf inputs require generated C#; generation was not run.");
+        return sources.OrderBy(path => path, StringComparer.Ordinal);
+    }
+
+    private string ReadUsings(ProjectSpec spec)
+    {
+        var usings = new HashSet<string>(StringComparer.Ordinal);
+        if (spec.Properties.GetValueOrDefault("ImplicitUsings") is "enable" or "true")
+        {
+            foreach (var value in new[] { "System", "System.Collections.Generic", "System.IO", "System.Linq", "System.Net.Http", "System.Threading", "System.Threading.Tasks" }) usings.Add(value);
+            if (spec.Sdk == "Microsoft.NET.Sdk.Web")
+                foreach (var value in new[] { "System.Net.Http.Json", "Microsoft.AspNetCore.Builder", "Microsoft.AspNetCore.Hosting", "Microsoft.AspNetCore.Http", "Microsoft.AspNetCore.Routing", "Microsoft.Extensions.Configuration", "Microsoft.Extensions.DependencyInjection", "Microsoft.Extensions.Hosting", "Microsoft.Extensions.Logging" }) usings.Add(value);
+        }
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "Using"))
+        {
+            if (item.Attribute("Remove") is { } remove) usings.Remove(remove.Value);
+            if (item.Attribute("Include") is not { } include) continue;
+            var name = Expand(include.Value, spec.Properties);
+            if (item.Attribute("Alias") is { } alias) name = alias.Value + " = " + name;
+            else if (IsTrue((string?)item.Attribute("Static"))) name = "static " + name;
+            usings.Add(name);
+        }
+        return string.Join("\n", usings.Select(value => $"global using {value};"));
+    }
+
+    private IEnumerable<string> ExpandItem(string root, string patterns)
+    {
+        foreach (var pattern in patterns.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (!pattern.Contains('*') && !pattern.Contains('?'))
+            {
+                var file = Resolve(root, pattern);
+                if (File.Exists(file)) yield return file;
+                else Warn(root, "source-item", $"Missing item: {pattern}");
+            }
+            else if (pattern.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(pattern))
+                Warn(root, "source-item", $"Unsupported external wildcard: {pattern}");
+            else foreach (var file in EnumerateFiles(root).Where(file => GlobMatches(Path.GetRelativePath(root, file), pattern))) yield return file;
+        }
+    }
+
+    private static IEnumerable<string> EnumerateFiles(string root) => Directory.EnumerateFiles(root, "*",
+        new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.ReparsePoint, IgnoreInaccessible = false });
+    private static bool IsOutputFile(string root, string file) => Path.GetRelativePath(root, file).Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+        .Any(part => part.Equals("bin", StringComparison.OrdinalIgnoreCase) || part.Equals("obj", StringComparison.OrdinalIgnoreCase) || part == ".git");
+    private static bool GlobMatches(string file, string pattern) => Regex.IsMatch(file.Replace('\\', '/'),
+        "^" + Regex.Escape(pattern.Replace('\\', '/')).Replace("\\*\\*/", "(?:.*/)?").Replace("\\*\\*", ".*").Replace("\\*", "[^/]*").Replace("\\?", "[^/]") + "$",
+        OperatingSystem.IsWindows() ? RegexOptions.IgnoreCase : RegexOptions.None);
+    private static string Expand(string value, Dictionary<string, string> properties) => Regex.Replace(value, @"\$\(([\w.]+)\)",
+        match => properties.GetValueOrDefault(match.Groups[1].Value, match.Value));
+    private static string Resolve(string root, string path) => Path.GetFullPath(Path.Combine(root, path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar)));
+    private static bool IsTrue(string? value) => bool.TryParse(value, out var result) && result;
+    private static bool IsFalse(string? value) => bool.TryParse(value, out var result) && !result;
+    private void Warn(string project, string id, string message) => report.Warn(id, $"{project}: {message}");
+    private static string? FindNearest(string root, string name)
+    {
+        for (var directory = new DirectoryInfo(root); directory != null; directory = directory.Parent)
+            if (File.Exists(Path.Combine(directory.FullName, name))) return Path.Combine(directory.FullName, name);
+        return null;
+    }
+    private static IEnumerable<string> FindAnalyzerConfigs(string root)
+    {
+        var paths = new HashSet<string>(ProjectLoader.PathComparer);
+        for (var directory = new DirectoryInfo(root); directory != null; directory = directory.Parent)
+            foreach (var name in new[] { ".editorconfig", ".globalconfig" })
+                if (File.Exists(Path.Combine(directory.FullName, name))) paths.Add(Path.Combine(directory.FullName, name));
+        foreach (var file in EnumerateFiles(root).Where(file => !IsOutputFile(root, file) &&
+            Path.GetFileName(file) is ".editorconfig" or ".globalconfig")) paths.Add(file);
+        return paths;
+    }
+    private static List<string> FindPackRoots()
+    {
+        var roots = new HashSet<string>(ProjectLoader.PathComparer);
+        foreach (var name in new[] { "DOTNET_ROOT", "DOTNET_ROOT_X64", "DOTNET_ROOT_X86" })
+            if (Environment.GetEnvironmentVariable(name) is { Length: > 0 } value) roots.Add(Path.Combine(value, "packs"));
+        var runtime = new DirectoryInfo(RuntimeEnvironment.GetRuntimeDirectory());
+        if (runtime.Parent?.Parent?.Parent is { } installation) roots.Add(Path.Combine(installation.FullName, "packs"));
+        foreach (var directory in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(Path.PathSeparator))
+            if (Directory.Exists(Path.Combine(directory, "packs"))) roots.Add(Path.Combine(directory, "packs"));
+        roots.Add(Environment.GetEnvironmentVariable("NUGET_PACKAGES") ?? Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages"));
+        return roots.Where(Directory.Exists).ToList();
+    }
+    private sealed record ProjectSpec(ProjectId Id, string Path, string Root, string Framework, string Sdk,
+        Dictionary<string, string> Properties, XElement[] Items, string[] References);
+}

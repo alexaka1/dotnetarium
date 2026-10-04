@@ -1,8 +1,6 @@
 using System.Collections.Immutable;
-using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
-using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using Dotnetarium.Analyzers;
 using Dotnetarium.Config;
@@ -39,29 +37,10 @@ internal static class Program
                 throw new FileNotFoundException("Project or solution was not found.", target);
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
-            var sdkQuery = VisualStudioInstanceQueryOptions.Default;
-            sdkQuery.WorkingDirectory = root;
-            var sdk = MSBuildLocator.QueryVisualStudioInstances(sdkQuery).FirstOrDefault() ??
-                throw new InvalidOperationException("No compatible .NET SDK was found.");
-            MSBuildLocator.RegisterInstance(sdk);
-
-            using var workspace = MSBuildWorkspace.Create();
-            var workspaceErrors = new List<string>();
-            bool workspaceFailure = false;
-            workspace.RegisterWorkspaceFailedHandler(diagnostic =>
-            {
-                workspaceErrors.Add(diagnostic.Diagnostic.Message);
-                workspaceFailure |= diagnostic.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure;
-            });
-
-            var projects = Path.GetExtension(target).ToLowerInvariant() switch
-            {
-                ".csproj" => new[] { await workspace.OpenProjectAsync(target) },
-                ".sln" or ".slnx" => (await workspace.OpenSolutionAsync(target)).Projects.ToArray(),
-                _ => throw new ArgumentException("Expected a .csproj, .sln, or .slnx path.")
-            };
-            if (!projects.Any(project => project.Language == LanguageNames.CSharp))
-                throw new ArgumentException("The target contains no C# projects.");
+            var report = new ScanReport();
+            using var inputs = options.ExperimentalDirect
+                ? await new DirectProjectLoader(report).LoadAsync(target)
+                : await ProjectLoader.LoadProjectAwareAsync(target, report);
 
             var analyzerTypes = typeof(DnaRuleCatalog).Assembly.GetTypes()
                 .Where(type => !type.IsAbstract && typeof(DiagnosticAnalyzer).IsAssignableFrom(type) &&
@@ -70,15 +49,26 @@ internal static class Program
                 .ToArray();
             var analyzers = analyzerTypes.Select(type => (DiagnosticAnalyzer)Activator.CreateInstance(type)!).ToImmutableArray();
             var diagnostics = new List<Diagnostic>();
-            bool compilerErrors = false;
-
-            foreach (var project in projects.Where(project => project.Language == LanguageNames.CSharp))
+            foreach (var project in inputs.Projects)
             {
-                var compilation = await project.GetCompilationAsync();
-                if (compilation == null)
+                Compilation? compilation;
+                try { compilation = await project.GetCompilationAsync(); }
+                catch (Exception error) when (error is not OperationCanceledException)
                 {
-                    Console.Error.WriteLine($"Unable to compile {project.Name}.");
-                    compilerErrors = true;
+                    report.Warn("compilation-load", $"{project.Name}: {error.Message}");
+                    report.SkippedProjects.Add(project.Name);
+                    continue;
+                }
+                if (compilation == null || !compilation.SyntaxTrees.Any())
+                {
+                    report.Warn("compilation-load", $"{project.Name}: no usable source compilation.");
+                    report.SkippedProjects.Add(project.Name);
+                    continue;
+                }
+                if (compilation.GetSpecialType(SpecialType.System_Object).TypeKind == TypeKind.Error)
+                {
+                    report.Warn("compilation-load", $"{project.Name}: core framework symbols are unavailable; no usable semantic analysis.");
+                    report.SkippedProjects.Add(project.Name);
                     continue;
                 }
 
@@ -91,23 +81,39 @@ internal static class Program
                 else if (File.Exists(defaultConfig) && !additionalFiles.Any(file => IsConfigurationFile(file.Path)))
                     additionalFiles = additionalFiles.Add(new FileAdditionalText(defaultConfig));
                 var configOptions = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
-                if (!configOptions.GlobalOptions.TryGetValue("build_property.IsTestProject", out _))
-                    configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, sdk.MSBuildPath);
+                if (inputs.TestProjectMetadata.TryGetValue(project.Id, out var isTestProject))
+                    configOptions = new ProjectAnalysisOptions(configOptions, isTestProject);
+                else if (!configOptions.GlobalOptions.TryGetValue("build_property.IsTestProject", out _) && inputs.MSBuildPath != null)
+                {
+                    try
+                    {
+                        configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, inputs.MSBuildPath);
+                    }
+                    catch (Exception error) when (error is not OperationCanceledException)
+                    {
+                        report.Warn("project-metadata", $"{project.Name}: {error.Message}");
+                    }
+                }
                 var analyzerOptions = new AnalyzerOptions(additionalFiles, configOptions);
-                var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
-                var projectErrors = result.Where(diagnostic =>
-                    diagnostic.Id == "AD0001" ||
-                    (diagnostic.Severity == DiagnosticSeverity.Error &&
-                     !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal))).ToArray();
-                compilerErrors |= projectErrors.Length > 0;
-                diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal)));
-                foreach (var error in projectErrors)
-                    Console.Error.WriteLine($"{project.Name}: {error}");
+                try
+                {
+                    var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
+                    report.AnalyzedProjects.Add(project.Name);
+                    diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal)));
+                    foreach (var error in result.Where(diagnostic => diagnostic.Id == "AD0001" ||
+                        (diagnostic.Severity == DiagnosticSeverity.Error && !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal))))
+                    {
+                        if (error.Id == "AD0001") report.Fail("analyzer-failure", $"{project.Name}: {error}");
+                        else report.Warn("compiler-error", $"{project.Name}: {error}");
+                    }
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    report.Fail("analysis-failure", $"{project.Name}: {error.Message}");
+                    report.SkippedProjects.Add(project.Name);
+                }
             }
-
-            foreach (var error in workspaceErrors.Distinct(StringComparer.Ordinal))
-                Console.Error.WriteLine("Workspace: " + error);
-            compilerErrors |= workspaceFailure;
+            if (report.AnalyzedProjects.Count == 0) report.Fail("no-analysis", "No usable C# projects were analyzed.");
 
             var findings = diagnostics
                 .GroupBy(diagnostic => new
@@ -121,6 +127,7 @@ internal static class Program
                 .OrderBy(diagnostic => diagnostic.Location.SourceTree?.FilePath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(diagnostic => diagnostic.Location.SourceSpan.Start)
                 .ThenBy(diagnostic => diagnostic.Id, StringComparer.Ordinal)
+                .ThenBy(diagnostic => diagnostic.GetMessage(), StringComparer.Ordinal)
                 .ToArray();
 
             foreach (var diagnostic in findings)
@@ -134,14 +141,13 @@ internal static class Program
                 Console.WriteLine($"{path}({line.StartLinePosition.Line + 1},{line.StartLinePosition.Character + 1}): {diagnostic.Id}{cwe}: {diagnostic.GetMessage()}");
             }
 
-            Console.WriteLine($"{findings.Length} security finding(s){(compilerErrors ? " (partial scan)" : string.Empty)}.");
-            if (compilerErrors)
-            {
-                Console.Error.WriteLine("Scan incomplete: project or workspace errors occurred.");
-                return 2;
-            }
+            foreach (var notice in report.Notices.Distinct())
+                Console.Error.WriteLine($"{(notice.IsFailure ? "Error" : "Coverage")}: {notice.Message}");
+            Console.WriteLine($"{findings.Length} security finding(s){(report.IsPartial ? " (partial scan)" : string.Empty)}; {report.AnalyzedProjects.Count} project compilation(s) analyzed.");
             if (options.SarifPath != null)
-                await SarifWriter.WriteAsync(options.SarifPath, target, findings);
+                await SarifWriter.WriteAsync(options.SarifPath, target, findings, report,
+                    options.ExperimentalDirect ? "direct" : "project");
+            if (report.HasFailures) return 2;
             return options.Fail && findings.Length > 0 ? 1 : 0;
         }
         catch (System.Text.Json.JsonException error)
@@ -161,6 +167,7 @@ internal static class Program
         "  --sarif <path>             Write SARIF 2.1.0\n" +
         "  --config <path>            Override dotnetarium.json (version 2.0)\n" +
         "  --fail                     Return 1 when findings are present\n" +
+        "  --experimental-direct      Reconstruct Roslyn inputs without MSBuild targets\n" +
         "  -h, --help                 Show this help");
 
     private sealed class FileAdditionalText(string path) : AdditionalText
@@ -176,12 +183,12 @@ internal static class Program
         string.Equals(Path.GetFileName(path), "dotnetarium.json", StringComparison.OrdinalIgnoreCase);
 
     private sealed record Options(string Target, string? SarifPath, string? ConfigPath,
-        bool Fail)
+        bool Fail, bool ExperimentalDirect)
     {
         internal static Options Parse(string[] args)
         {
             string? target = null, sarif = null, config = null;
-            bool fail = false;
+            bool fail = false, experimentalDirect = false;
             for (int index = 0; index < args.Length; index++)
             {
                 var arg = args[index];
@@ -192,6 +199,7 @@ internal static class Program
                     case "--sarif": sarif = NextValue(); break;
                     case "--config": config = NextValue(); break;
                     case "--fail": fail = true; break;
+                    case "--experimental-direct": experimentalDirect = true; break;
                     default:
                         if (arg.StartsWith("-", StringComparison.Ordinal))
                             throw new ArgumentException($"Unknown option {arg}.");
@@ -203,7 +211,7 @@ internal static class Program
             }
             if (target == null) throw new ArgumentException("A project or solution path is required.");
             if (config != null && !File.Exists(config)) throw new ArgumentException($"Configuration not found: {config}");
-            return new Options(target, sarif, config, fail);
+            return new Options(target, sarif, config, fail, experimentalDirect);
         }
     }
 }
