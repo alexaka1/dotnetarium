@@ -1,7 +1,8 @@
 # Build-independent Roslyn experiment
 
 Status: direct-loader prototype, input comparison, bounded restore validation,
-explicit generated-C# reuse and configuration/framework selection implemented.
+explicit generated-C# reuse, configuration/framework selection and conventional
+framework package pruning implemented.
 Branch: `experiment/build-independent-roslyn`.
 This work must stay off `main` until its coverage and limitations are reviewed.
 
@@ -35,6 +36,8 @@ symbols with name-based security guesses.
 - [x] Select configuration and root framework explicitly; retain compatible source
       dependencies and configuration-specific generated output.
 - [x] Measure custom imports/build workflows and an SDK-pinned real project.
+- [x] Validate conventional source-dependency pruning and resolve global
+      package/framework assembly conflicts without package-name exceptions.
 - [x] Record measured results, gaps, and the next experiment in this document.
 
 ## Experiment boundaries
@@ -231,10 +234,46 @@ can still be analyzed independently when its parent's cached bindings are reject
 
 Floating/unresolved versions, unsupported item operations/imports/conditions,
 central transitive pinning/global references, unsupported child asset propagation,
-framework package pruning in a package-bearing child and missing/error restore
+custom/unsupported pruning arrangements and missing/error restore
 metadata remain `unverified`. These limits are explicit rather than a replacement
 NuGet resolver. Matching validates supported restore requests, not freshness of
 feeds or every SDK-generated restore property.
+
+### Conventional framework package pruning
+
+The next slice supports the omission of platform-provided package edges from
+source dependencies. NuGet can privatize a prunable direct reference while
+retaining its restore request and resolved package node; its compile/runtime
+assets become placeholders. A parent can also prune a transitive request from a
+lower-framework child that still needs the package in its own compilation.
+[NuGet pruning behavior](https://learn.microsoft.com/en-us/nuget/consume-packages/package-references-in-project-files#prunepackagereference).
+
+Validation retains the existing ownership, request/metadata, project identity,
+framework and recursive graph checks. It accepts an omitted edge only with a
+recorded pruning range covering the request and no active resolved assets in
+that pruning context. Both child and parent contexts are considered. Explicit
+pruning-policy changes invalidate incompatible saved metadata. Unrelated missing
+edges remain rejected. Package names are not special-cased.
+
+The bounded proof supports stable numeric requests and the SDK's inclusive
+maximum pruning ranges. Prerelease/floating/custom ranges or ambiguous metadata
+remain unverified. Explicit `PrunePackageReference` items are unsupported inputs,
+so editing custom pruning rules cannot silently reuse old bindings. This checks
+conventional saved restore evidence, not every SDK pruning policy or data revision.
+
+Real-restored .NET 8/10 CLI fixtures verify request/policy changes, unrelated
+missing edges, out-of-range omissions, custom pruning items, and contradictory
+pruning records with live package assemblies. They compare complete findings and
+flows against project-aware loading. The .NET 8 child uses package System.Text.Json
+9; the .NET 10 compilation uses its framework System.Text.Json 10.
+
+This exposed a separate input bug: framework and newer package assemblies were
+both passed to Roslyn, producing ambiguous types. Global package/framework
+conflicts with matching assembly name, culture and public-key token now compare
+assembly version, then file version, preferring the platform on a tie. Explicit
+HintPath and aliased references retain their metadata. This is bounded conflict
+resolution; custom package ranks/overrides are not a full SDK recreation.
+[SDK conflict resolver](https://github.com/dotnet/sdk/blob/main/src/Tasks/Common/ConflictResolution/ConflictResolver.cs).
 
 Stale/unverified cached package bindings are omitted. Framework packs, explicit
 assembly references and available source project compilations still feed the
@@ -451,12 +490,19 @@ Measured on 2026-10-04 with explicit Release selection:
 | SharpSaster, locally upgraded corpus | `net10.0` | 41 identical complete SARIF results, including engine flows, in project-aware/direct modes | Configuration selection preserves existing findings; direct mode still reports omitted generation |
 | HelveticOps Application + Domain, commit `49dd07b` | `net8.0` | 2 compilations, 0 findings, no coverage notices, no assets/restore/build | Shared `Directory.Build.props`, framework-only source reference and an SDK-8-pinned repository scan using available reference packs |
 | LANCommander UI + SDK + Steam, commit `4a2eef7`, locally upgraded UI corpus | `net10.0` | 3 compilations, partial coverage | Real custom npm/completion targets are not run; omitted package bindings and generated inputs prevent a clean conclusion |
+| LANCommander after pruning fix, compilation-input inspection only | `net10.0` | All 3 restore graphs matched; 4 compiler errors instead of 1,195 | UI/SDK/Steam reference counts are 298/271/176; no restore, custom targets or security analyzers ran during this inspection |
 
-LANCommander demonstrates a concrete remaining dependency gap: a source
-dependency's framework package pruning makes the parent restore graph unverified.
-The loader conservatively omits cached parent package bindings, producing many
-unresolved symbols. Zero findings in this case do not establish absence of
-vulnerabilities, and no equivalence with a full project-aware scan is claimed.
+The initial LANCommander scan exposed a dependency gap: source-dependency
+framework pruning made parent restore graphs unverified. The loader omitted
+cached parent package bindings and reported 1,195 compiler errors. The subsequent
+pruning slice supports conventional pruned graphs as described above. Zero
+findings in the initial scan do not establish absence of vulnerabilities, and
+no equivalence with a full project-aware scan is claimed.
+The follow-up input-only inspection independently confirms restored bindings:
+UI and Steam compile without errors; SDK has four errors from missing generated
+SignalR partial methods and PowerShell cmdlet extensions. This is a loader and
+compiler measurement, not a completed security audit. Generated-input policy is
+therefore the next concrete coverage decision.
 The custom-import fixture separately demonstrates an actual missed finding when
 an imported file is unavailable. These cases argue against silently promoting
 the prototype to the default or treating an automatic fallback as equivalent.
@@ -476,15 +522,16 @@ the prototype to the default or treating an automatic fallback as equivalent.
    real Razor/gRPC positive and safe cases, mapped SARIF and target nonexecution.
    Evaluate controlled SDK generation separately, without arbitrary custom
    target execution. Source-generator policy remains a separate decision.
-4. **Selection/corpus slice complete:** configuration/framework selection and
-   real custom-build/SDK-pinned projects. Custom-import source omissions and
-   framework package pruning remain explicit coverage gaps. Before production
-   promotion, validate common pruning/asset propagation and decide whether to
-   support bounded imports or keep them as an explicit partial-coverage boundary.
+4. **Selection/corpus/pruning slices complete:** configuration/framework
+   selection, real custom-build/SDK-pinned projects, conventional direct/transitive
+   pruning and global package/framework assembly conflicts. Before production
+   promotion, decide whether to support bounded imports or keep omitted imports
+   as an explicit partial-coverage boundary. Complex asset propagation, custom
+   pruning and full SDK conflict policy remain unsupported.
 5. Require passing Windows/Linux CI and repeatable finding/flow comparisons
    before considering automatic fallback or a default-loading change.
 
-The direct prototype, inventory, bounded validation, explicit reuse and selection
-slices are complete. Production promotion, automatic fallback,
+The direct prototype, inventory, bounded validation, explicit reuse, selection and
+conventional pruning slices are complete. Production promotion, automatic fallback,
 full import evaluation and generation support are intentionally not complete.
 No release or merge into `main` is part of this work.

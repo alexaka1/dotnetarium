@@ -332,6 +332,15 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                 var (declaredPackages, incomplete) = PackageInputs(spec);
                 var validation = RestoredAssetsValidator.Validate(assetsPath, assets.RootElement, spec.Path, spec.Framework,
                     declaredPackages, spec.References, incomplete);
+                if (validation.Status == "matched") validation = FrameworkPackagePruning.ValidatePolicy(assetsPath, assets.RootElement,
+                    spec.Framework, spec.Properties.GetValueOrDefault("RestoreEnablePackagePruning"));
+                if (validation.Status == "matched")
+                    foreach (var package in declaredPackages)
+                        if (FrameworkPackagePruning.TryOmit(assets.RootElement, spec.Framework, package.Key, package.Value.Version, out _) is { } reason)
+                        {
+                            validation = new(assetsPath, "unverified", reason);
+                            break;
+                        }
                 if (validation.Status == "matched") validation = ValidateProjectGraph(spec, assetsPath, assets.RootElement);
                 inputs.RestoredAssets[spec.Id] = validation;
                 if (collectPackageInventory) inputs.PackageInventories[spec.Id] = RestoredPackageInventory.Read(assets.RootElement, spec.Framework, spec.Root);
@@ -392,6 +401,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
             if (spec.Items.Any(item => item.Name.LocalName == "PackageReference"))
                 Warn(spec.Path, "package-assets", "Restored package assets are absent; package API bindings may be unavailable. Restore separately to improve coverage.");
         }
+        FrameworkReferenceConflicts.Resolve(paths, packageReferences);
         return paths.Concat(hints.Keys).Concat(packageReferences.Keys).Distinct(ProjectLoader.PathComparer).Select(path =>
         {
             var properties = hints.GetValueOrDefault(path, MetadataReferenceProperties.Assembly);
@@ -418,7 +428,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
         // Pinning and global references alter the exported restore graph. They
         // remain unverified until their full NuGet semantics are supported.
         incomplete |= IsTrue(spec.Properties.GetValueOrDefault("CentralPackageTransitivePinningEnabled")) ||
-            spec.Items.Any(item => item.Name.LocalName == "GlobalPackageReference");
+            spec.Items.Any(item => item.Name.LocalName is "GlobalPackageReference" or "PrunePackageReference");
         var versions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var item in spec.Items.Where(item => item.Name.LocalName == "PackageVersion"))
         {
@@ -476,6 +486,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                 if (child == null) return Unknown($"No compatible source dependency framework: {path}");
                 var (packages, incomplete) = PackageInputs(child);
                 var childAssetsPath = AssetsPath(child);
+                var prunedByChild = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 if (!File.Exists(childAssetsPath))
                 {
                     if (packages.Count > 0 || child.References.Length > 0 || incomplete)
@@ -486,13 +497,18 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                     using var childAssets = JsonDocument.Parse(File.ReadAllText(childAssetsPath));
                     var childState = RestoredAssetsValidator.Validate(childAssetsPath, childAssets.RootElement, child.Path, child.Framework,
                         packages, child.References, incomplete);
+                    if (childState.Status == "matched") childState = FrameworkPackagePruning.ValidatePolicy(childAssetsPath, childAssets.RootElement,
+                        child.Framework, child.Properties.GetValueOrDefault("RestoreEnablePackagePruning"));
                     if (childState.Status != "matched") return new(assetsPath, childState.Status, $"Source dependency {path}: {childState.Reason}");
                     if (childAssets.RootElement.TryGetProperty("logs", out var childLogs) && childLogs.EnumerateArray().Any(log =>
                         log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
                         return Unknown($"Source dependency restore contains errors: {path}");
-                    if (childAssets.RootElement.GetProperty("project").GetProperty("frameworks").GetProperty(child.Framework)
-                        .TryGetProperty("packagesToPrune", out var pruning) && packages.Keys.Any(id => pruning.TryGetProperty(id, out _)))
-                        return Unknown($"Source dependency uses framework package pruning that requires further propagation validation: {path}");
+                    foreach (var package in packages)
+                    {
+                        if (FrameworkPackagePruning.TryOmit(childAssets.RootElement, child.Framework, package.Key, package.Value.Version, out var omitted) is { } reason)
+                            return Unknown($"Source dependency {path}: {reason}");
+                        if (omitted) prunedByChild.Add(package.Key);
+                    }
                 }
                 var entries = libraries.EnumerateObject().Where(library =>
                     library.Value.TryGetProperty("type", out var type) && type.GetString() == "project" &&
@@ -507,6 +523,10 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                 foreach (var package in packages)
                 {
                     if (package.Value.PrivateAssets?.Equals("all", StringComparison.OrdinalIgnoreCase) == true) continue;
+                    if (prunedByChild.Contains(package.Key)) continue;
+                    if (FrameworkPackagePruning.TryOmit(assets, root.Framework, package.Key, package.Value.Version, out var prunedByParent) is { } reason)
+                        return Unknown(reason);
+                    if (prunedByParent) continue;
                     if (!package.Value.IncludeAssets.Equals("all", StringComparison.OrdinalIgnoreCase) ||
                         !package.Value.ExcludeAssets.Equals("none", StringComparison.OrdinalIgnoreCase) ||
                         (package.Value.PrivateAssets != null && !RestoredAssetsValidator.DefaultPrivateAssets(package.Value.PrivateAssets)))

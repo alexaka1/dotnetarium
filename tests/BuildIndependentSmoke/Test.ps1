@@ -415,6 +415,7 @@ if (@($generatorAware.inputInventory.projects[0].sources | Where-Object origin -
 
 . (Join-Path $PSScriptRoot 'Test-Freshness.ps1')
 . (Join-Path $PSScriptRoot 'Test-Packages.ps1')
+. (Join-Path $PSScriptRoot 'Test-Pruning.ps1')
 . (Join-Path $PSScriptRoot 'Test-Selection.ps1')
 . (Join-Path $PSScriptRoot 'Test-GeneratedReuse.ps1')
 

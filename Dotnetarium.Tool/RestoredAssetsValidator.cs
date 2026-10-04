@@ -91,7 +91,7 @@ internal static class RestoredAssetsValidator
 
     // Equality normalization for conventional NuGet requests. This is not a
     // resolver: floating/complex requests stay unverified instead of guessed.
-    private static string? NormalizeRange(string value)
+    internal static string? NormalizeRange(string value)
     {
         value = Regex.Replace(value, "\\s+", "");
         if (value.Length == 0 || value.Contains('*') || value.Contains("$(", StringComparison.Ordinal)) return null;
