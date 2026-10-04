@@ -508,6 +508,51 @@ budget and was stopped at approximately 976 seconds without a completed SARIF
 result. No finding total or clean-scan conclusion is available for that run.
 Profile analyzer performance on this corpus separately; compilation-input
 inspection above does not establish end-to-end scanner performance.
+
+### Runtime investigation and generator boundary
+
+Managed stack snapshots using [dotnet-stack](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-stack)
+identified repeated interface-dispatch enumeration of referenced metadata types.
+Each taint operation visitor walked the merged compilation namespace, expanded
+metadata type members and calculated their interface closures, then discarded
+targets without source bodies. Dispatch candidates are now indexed once per
+compilation and shared across visitors and taint rules. Receiver/initializer/DI
+decisions still run first and are not cached as universal dispatch decisions.
+The source index includes referenced source compilations, concrete nested types,
+explicit implementations and inherited source methods; emitted metadata bodies
+remain unavailable to interprocedural analysis.
+
+In separate per-analyzer LANCommander UI observations, command-injection analysis
+took 48.47 seconds before the change and 14.99 seconds after it, with zero findings
+in both runs. These are local observations under different concurrent workloads,
+not a controlled benchmark or evidence of completed whole-project analysis.
+The 631 unit tests pass, and SharpSaster retains all 41 complete SARIF results and
+flow witnesses from the preceding project-aware/direct comparison.
+The follow-up default analyzer run still exceeded the 900-second budget and was
+stopped at 908.49 seconds without completed SARIF. Subsequent stack snapshots
+show interprocedural points-to/taint analysis and standalone lambda analysis,
+instead of repeated metadata implementation enumeration. Those remaining costs
+need per-rule/per-entry-method profiling before the runtime gate can be closed;
+this change must not be described as a completed LANCommander security scan.
+
+A temporary input-only Roslyn generator probe also evaluated the reviewed local
+PowerShell cmdlet registration generator and the cached Microsoft SignalR client
+generator package (`7.0.0-preview.7.22376.6`). Three generator instances produced
+eight C# trees: SDK source count increased from 291 to 299 and all three selected
+compilations then had zero compiler errors. The old SignalR generator emitted
+three callback warnings, which were retained in the probe log. Zero compiler
+errors do not establish generator correctness or finding parity. This probe ran
+outside the scanner and did not run project builds, npm, completion-generation
+targets, restore or security analyzers.
+
+The direct scanner still does not execute generators. Project references with
+`OutputItemType="Analyzer"` now receive an explicit missing-generation notice and
+are excluded from the semantic source dependency closure, including when
+`ReferenceOutputAssembly` is omitted. CLI fixtures verify both metadata variants
+and custom target nonexecution. Explicitly selected generated C# remains the
+supported recovery path. Any future generator execution needs a separate opt-in
+policy covering exact assemblies, their dependencies, additional inputs, options,
+failure reporting and isolation; package discovery alone must not trigger it.
 The custom-import fixture separately demonstrates an actual missed finding when
 an imported file is unavailable. These cases argue against silently promoting
 the prototype to the default or treating an automatic fallback as equivalent.

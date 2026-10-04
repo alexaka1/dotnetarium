@@ -1,5 +1,32 @@
 # Generation happens only during controlled fixture setup. The scanner must
 # reuse explicitly selected C# without invoking the target's build pipeline.
+$projectGeneratorRoot = Join-Path $scratch 'project-generator-boundary'
+New-Item -ItemType Directory -Path $projectGeneratorRoot -Force | Out-Null
+$projectGeneratorMarker = Join-Path $scratch 'project-generator-ran.txt'
+$projectGeneratorProject = Join-Path $projectGeneratorRoot 'Consumer.csproj'
+Copy-Item -LiteralPath (Join-Path $projectRoot 'Inputs.cs') -Destination $projectGeneratorRoot
+# Deliberately unreadable project: generator dependencies must not enter the
+# compilation closure, including when ReferenceOutputAssembly is omitted.
+'<Project Sdk="Unsupported.Custom.Generator"><Target Name="Generate"><Error Text="Must not run" /></Target></Project>' |
+    Set-Content -LiteralPath (Join-Path $projectGeneratorRoot 'Generator.csproj')
+foreach ($referenceMetadata in @('ReferenceOutputAssembly="false"', '')) {
+    @"
+<Project Sdk="Microsoft.NET.Sdk">
+<PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+<ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /><ProjectReference Include="Generator.csproj" OutputItemType="Analyzer" $referenceMetadata /></ItemGroup>
+<Target Name="MustNotRun" BeforeTargets="CoreCompile"><WriteLinesToFile File="$projectGeneratorMarker" Lines="executed" /></Target>
+</Project>
+"@ | Set-Content -LiteralPath $projectGeneratorProject
+    $projectGeneratorScan = Scan $projectGeneratorProject $true
+    SameFindings $baseline $projectGeneratorScan
+    if ($projectGeneratorScan.inputInventory.projects.Count -ne 1 -or
+        @($projectGeneratorScan.inputInventory.projects | ForEach-Object projectReferences).Count -ne 0 -or
+        -not (HasNotice $projectGeneratorScan 'generation') -or
+        (HasNotice $projectGeneratorScan 'project-load') -or
+        (Test-Path -LiteralPath $projectGeneratorMarker)) { throw 'Generator project execution/coverage boundary was lost.' }
+}
+'Source-generator project boundary checks passed.' | Write-Output
+
 $generatedGrpcRoot = Join-Path $scratch 'generated-grpc'
 $protoRoot = Join-Path $generatedGrpcRoot 'Protos'
 New-Item -ItemType Directory -Path $protoRoot -Force | Out-Null

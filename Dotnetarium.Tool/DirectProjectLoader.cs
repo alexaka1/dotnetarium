@@ -208,6 +208,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                 if (FindNearest(root, "Directory.Build.targets") is { } targets)
                     Warn(path, "import", $"Directory.Build.targets was not evaluated: {targets}");
                 var references = items.Where(item => item.Name.LocalName == "ProjectReference")
+                    .Where(item => !string.Equals(Expand(ItemMetadata(item, "OutputItemType") ?? "", evaluated), "Analyzer", StringComparison.OrdinalIgnoreCase))
                     .Where(item => !IsFalse(Expand(ItemMetadata(item, "ReferenceOutputAssembly") ?? "true", evaluated)))
                     .Select(item => Expand((string?)item.Attribute("Include") ?? "", evaluated))
                     .Where(value => value.Length > 0).Select(value => Resolve(root, value)).ToArray();
@@ -301,6 +302,9 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
 
     private List<MetadataReference> ReadReferences(ProjectSpec spec, ScanInputs inputs)
     {
+        foreach (var generator in spec.Items.Where(item => item.Name.LocalName == "ProjectReference" &&
+            string.Equals(Expand(ItemMetadata(item, "OutputItemType") ?? "", spec.Properties), "Analyzer", StringComparison.OrdinalIgnoreCase)))
+            Warn(spec.Path, "generation", $"Analyzer/source-generator project was not built or executed: {Expand((string?)generator.Attribute("Include") ?? "", spec.Properties)}. Supply generated C# explicitly to recover generated bindings.");
         var paths = new HashSet<string>(ProjectLoader.PathComparer);
         var hints = new Dictionary<string, MetadataReferenceProperties>(ProjectLoader.PathComparer);
         var packageReferences = new Dictionary<string, MetadataReferenceProperties>(ProjectLoader.PathComparer);
