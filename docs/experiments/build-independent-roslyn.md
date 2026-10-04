@@ -1,7 +1,7 @@
 # Build-independent Roslyn experiment
 
-Status: first prototype and compilation-input comparison implemented and locally
-verified on Windows.
+Status: direct-loader prototype, input comparison, bounded restore validation
+and explicit generated-C# reuse implemented and locally verified on Windows.
 Branch: `experiment/build-independent-roslyn`.
 This work must stay off `main` until its coverage and limitations are reviewed.
 
@@ -196,6 +196,84 @@ dotnet Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll path/to/App.csp
 ./tests/BuildIndependentSmoke/Compare-Inputs.ps1 -ProjectInventory project-inputs.json -DirectInventory direct-inputs.json -OutputPath comparison.json
 ```
 
+## Restore validation and generated-C# reuse
+
+The next slice validates the cached restore request against the current supported
+project inputs. It checks project ownership/path, target framework, direct package
+requests, package aliases and include/exclude/private asset metadata, and source
+project-reference paths. Ordinary versions and interval requests are compared
+after equality normalization; a NuGet minimum request such as `3.35.1` is not an
+exact-version pin. [NuGet version semantics](https://learn.microsoft.com/en-us/nuget/concepts/package-versioning).
+
+Validation uses dependency metadata rather than modification times. Equivalent
+version spellings and an old assets timestamp remain usable. Changed versions,
+added/removed packages, changed aliases/asset selection, different project paths
+and changed source references produce `package-assets-stale` notifications.
+
+Unresolved/central versions, floating requests, unsupported package item
+operations/imports/conditions, missing restore metadata and package-bearing
+source dependency graphs are `unverified`. A parent can have stale transitive
+bindings even when its direct requests match. This slice does not prove that
+transitive graph; framework-only DTO references remain supported.
+
+Stale/unverified cached package bindings are omitted. Framework packs, explicit
+assembly references and available source project compilations still feed the
+engine; independent findings are retained in a partial scan. The scanner does
+not restore, download replacements or run target build tasks. Use explicit
+references for unsupported dependency arrangements; restoring alone cannot make
+an unsupported evaluator arrangement verifiable in this prototype.
+
+The input inventory adds `restoredAssets` with relative path, status and reason.
+States are `matched`, `stale`, `unverified`, `invalid` or `absent`. `matched` means
+the supported dependency request matched the saved metadata, not proof of complete
+generation/import parity, package-content integrity or the newest feed version.
+Restored package aliases now reach Roslyn correctly.
+
+Default source/config globs exclude custom output/intermediate directories as
+well as `obj`/`bin`. Literal and supported in-project wildcard `Compile` items
+can explicitly select generated C#. Conventional `IntermediateOutputPath`
+is reconstructed per configuration/TFM, for example:
+
+```xml
+<ItemGroup>
+  <Compile Include="$(IntermediateOutputPath)Protos/*.cs" />
+</ItemGroup>
+```
+
+For Razor, select the materialized SDK-generated `*_razor.g.cs`/`*_cshtml.g.cs`
+files and explicitly provide the corresponding markup through `AdditionalFiles`
+when needed for render-mode evidence. The controlled fixture setup uses
+`EmitCompilerGeneratedFiles` to materialize them; the scanner does not invoke that
+generation. Include only the intended framework/configuration output, and refresh
+it separately when templates, schemas, dependencies or generator settings change.
+
+Reused output C# produces a `generated-reuse` coverage notification. Its freshness
+and generation provenance are unverified; an explicit selection is not a complete
+scan guarantee. Scanning never automatically consumes the existing output tree.
+
+Razor `#line` mappings now place CLI/SARIF finding and flow locations in the
+original markup when available, with relative paths. Hidden/unmapped generated
+sections retain their physical C# locations.
+
+Verified with the unchanged engine and analyzer dependencies:
+
+| Case | Result |
+| --- | --- |
+| Fresh protobuf package and restored package alias | Real assembly binds; baseline findings/flows retained |
+| Equivalent minimum requests and old assets timestamp | Metadata remains matched; bindings preserved |
+| Changed version constraint, version, package set, alias, asset metadata or reference paths | Cached package bindings omitted; independent findings retained; partial SARIF |
+| Floating/missing version or package-bearing source dependency | Unverified restore graph is visible; independent findings retained |
+| Custom intermediate directory | Unselected C# excluded; explicit selection adds its real command finding and reuse notice |
+| Real protoc-generated service, before/after explicit C# selection | 3 / 4 findings; the missing request-to-command finding returns with the same witness as project-aware loading |
+| Protobuf reuse with a failing custom build target | Same 4 findings; target marker was not written |
+| Real SDK-generated Razor page/component | 2 raw-output findings; encoded controls excluded; locations `Pages/Probe.cshtml:2` and `Probe.razor:3` |
+| SharpSaster | Same 41 complete finding/flow results as the recorded project-aware baseline |
+
+Generation in these positive fixtures is a separate controlled test-setup build.
+The direct scanner's build-independent behavior is checked after that setup.
+Automatic generators, restore execution and automatic fallback remain separate
+decisions. This work changes no analyzer rule, engine algorithm or package version.
+
 ## Known prototype limitations
 
 - Only conventional SDK projects with exact `net8.0` and `net10.0` TFMs are
@@ -207,9 +285,12 @@ dotnet Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll path/to/App.csp
   `Directory.Build.targets` are reported rather than evaluated.
 - Package compile references come from existing `project.assets.json` and its
   package folders. No dependency version is guessed or silently downloaded.
-  Reference packs can also be read from the local NuGet cache. Assets freshness,
-  richer package metadata, package-provided aliases, and build-time assets need further work.
-  Explicit assembly/source project aliases and interop metadata are supported.
+  Reference packs can also be read from the local NuGet cache. Supported direct
+  restore requests are validated; unsupported requests and package-bearing source
+  dependency graphs omit cached bindings and report partial coverage. Broader
+  graph/central-package validation and build-time assets need further work.
+  Restored package aliases, explicit assembly/source project aliases and interop
+  metadata are supported.
   Package build-time inputs are reported when present. Properties such as
   `IsTestProject` are only reconstructed from the supported project/props files;
   values contributed by package imports may differ from project-aware loading.
@@ -232,16 +313,19 @@ dotnet Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll path/to/App.csp
    references, included sources, generated inputs, effective compiler settings
    and available target-framework/configuration metadata. Measured settings and
    reference-metadata discrepancies are fixed and covered by CLI fixtures.
-2. Validate assets freshness and more source/reference/configuration metadata.
-   Fix measured discrepancies while keeping unknown inputs visible.
-3. Reuse explicitly supplied generated C# and measure Razor/gRPC coverage. Then
-   evaluate controlled SDK generation separately, without arbitrary custom
-   target execution. Source-generator policy needs a separate decision.
+2. **Bounded prototype complete:** validate conventional direct restore requests,
+   package aliases/asset metadata and source-reference paths. Keep unsupported and
+   transitive graph arrangements unverified; extend those validators separately.
+3. **Reuse verified:** explicitly supplied generated C#, custom output selection,
+   real Razor/gRPC positive and safe cases, mapped SARIF and target nonexecution.
+   Evaluate controlled SDK generation separately, without arbitrary custom
+   target execution. Source-generator policy remains a separate decision.
 4. Extend the real-project corpus with custom imports and build workflows.
    Review false positives as well as missed findings and unresolved bindings.
 5. Require passing Windows/Linux CI and repeatable finding/flow comparisons
    before considering automatic fallback or a default-loading change.
 
-The first experiment and input-inventory step are complete. Production promotion, automatic fallback,
+The direct prototype, inventory, bounded validation and explicit reuse slices are
+complete. Production promotion, automatic fallback,
 full import evaluation and generation support are intentionally not complete.
 No release or merge into `main` is part of this work.

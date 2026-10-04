@@ -74,6 +74,10 @@ internal sealed class CompilationInputInventory(string target, bool direct)
             targetFrameworkSource = Property("TargetFramework") != null ? "project-metadata" : frameworkSymbol != null ? "preprocessor-symbol" : "unavailable",
             configuration = Property("Configuration"),
             platformProperty = Property("Platform"),
+            restoredAssets = inputs.RestoredAssets.TryGetValue(project.Id, out var assets) ? new
+            {
+                path = Relative(assets.Path), status = assets.Status, reason = assets.Reason
+            } : null,
             parse = ParseSettings(project.ParseOptions),
             compilation = new
             {
