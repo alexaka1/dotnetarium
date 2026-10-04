@@ -503,6 +503,11 @@ UI and Steam compile without errors; SDK has four errors from missing generated
 SignalR partial methods and PowerShell cmdlet extensions. This is a loader and
 compiler measurement, not a completed security audit. Generated-input policy is
 therefore the next concrete coverage decision.
+The separate default security-analyzer run exceeded a 15-minute observation
+budget and was stopped at approximately 976 seconds without a completed SARIF
+result. No finding total or clean-scan conclusion is available for that run.
+Profile analyzer performance on this corpus separately; compilation-input
+inspection above does not establish end-to-end scanner performance.
 The custom-import fixture separately demonstrates an actual missed finding when
 an imported file is unavailable. These cases argue against silently promoting
 the prototype to the default or treating an automatic fallback as equivalent.
@@ -529,7 +534,9 @@ the prototype to the default or treating an automatic fallback as equivalent.
    as an explicit partial-coverage boundary. Complex asset propagation, custom
    pruning and full SDK conflict policy remain unsupported.
 5. Require passing Windows/Linux CI and repeatable finding/flow comparisons
-   before considering automatic fallback or a default-loading change.
+   before considering automatic fallback or a default-loading change. Investigate
+   the large-corpus analyzer runtime before concluding the experiment; do not
+   silently treat a timed-out analyzer run as a completed partial scan.
 
 The direct prototype, inventory, bounded validation, explicit reuse, selection and
 conventional pruning slices are complete. Production promotion, automatic fallback,
