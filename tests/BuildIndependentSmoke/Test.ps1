@@ -48,7 +48,7 @@ public static class Inputs
 if ($LASTEXITCODE -ne 0) { throw 'Baseline fixture restore failed.' }
 
 $script:scanIndex = 0
-function Scan([string]$Target, [bool]$Direct, [int]$ExpectedExit = 0, [bool]$Fail = $false) {
+function Scan([string]$Target, [bool]$Direct, [int]$ExpectedExit = 0, [bool]$Fail = $false, [string[]]$Selection = @()) {
     $script:scanIndex++
     $sarif = Join-Path $scratch "scan-$script:scanIndex.sarif"
     $log = Join-Path $scratch "scan-$script:scanIndex.log"
@@ -56,6 +56,7 @@ function Scan([string]$Target, [bool]$Direct, [int]$ExpectedExit = 0, [bool]$Fai
     $arguments = @($ToolDll, $Target, '--sarif', $sarif, '--experimental-inputs', $inventory)
     if ($Direct) { $arguments += '--experimental-direct' }
     if ($Fail) { $arguments += '--fail' }
+    $arguments += $Selection
     & dotnet @arguments > $log 2>&1
     if ($LASTEXITCODE -ne $ExpectedExit -or -not (Test-Path -LiteralPath $sarif)) {
         Get-Content -LiteralPath $log | Write-Host
@@ -414,6 +415,7 @@ if (@($generatorAware.inputInventory.projects[0].sources | Where-Object origin -
 
 . (Join-Path $PSScriptRoot 'Test-Freshness.ps1')
 . (Join-Path $PSScriptRoot 'Test-Packages.ps1')
+. (Join-Path $PSScriptRoot 'Test-Selection.ps1')
 . (Join-Path $PSScriptRoot 'Test-GeneratedReuse.ps1')
 
 "Build-independent CLI checks passed. Reports and logs: $scratch" | Write-Output

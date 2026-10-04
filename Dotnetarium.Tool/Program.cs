@@ -38,10 +38,12 @@ internal static class Program
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
             var report = new ScanReport();
-            var inventory = options.InputInventoryPath != null ? new CompilationInputInventory(target, options.ExperimentalDirect) : null;
+            var selection = new ScanSelection(options.Configuration, options.Framework);
+            var inventory = options.InputInventoryPath != null ? new CompilationInputInventory(target, options.ExperimentalDirect, selection) : null;
             using var inputs = options.ExperimentalDirect
-                ? await new DirectProjectLoader(report, inventory != null).LoadAsync(target)
-                : await ProjectLoader.LoadProjectAwareAsync(target, report);
+                ? await new DirectProjectLoader(report, inventory != null, selection).LoadAsync(target)
+                : await ProjectLoader.LoadProjectAwareAsync(target, report, selection);
+            selection.Apply(inputs, target, report);
 
             var analyzerTypes = typeof(DnaRuleCatalog).Assembly.GetTypes()
                 .Where(type => !type.IsAbstract && typeof(DiagnosticAnalyzer).IsAssignableFrom(type) &&
@@ -90,7 +92,8 @@ internal static class Program
                 {
                     try
                     {
-                        configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, inputs.MSBuildPath);
+                        configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, inputs.MSBuildPath,
+                            selection.Configuration, ScanSelection.FrameworkOf(project));
                     }
                     catch (Exception error) when (error is not OperationCanceledException)
                     {
@@ -172,6 +175,8 @@ internal static class Program
         "  --sarif <path>             Write SARIF 2.1.0\n" +
         "  --config <path>            Override dotnetarium.json (version 2.0)\n" +
         "  --fail                     Return 1 when findings are present\n" +
+        "  --configuration <name>     Select project configuration (e.g. Release)\n" +
+        "  --framework <tfm>          Select root framework and compatible dependencies\n" +
         "  --experimental-direct      Reconstruct Roslyn inputs without MSBuild targets\n" +
         "  --experimental-inputs <path> Write compilation input inventory as JSON\n" +
         "  -h, --help                 Show this help");
@@ -189,11 +194,11 @@ internal static class Program
         string.Equals(Path.GetFileName(path), "dotnetarium.json", StringComparison.OrdinalIgnoreCase);
 
     private sealed record Options(string Target, string? SarifPath, string? ConfigPath,
-        bool Fail, bool ExperimentalDirect, string? InputInventoryPath)
+        bool Fail, bool ExperimentalDirect, string? InputInventoryPath, string? Configuration, string? Framework)
     {
         internal static Options Parse(string[] args)
         {
-            string? target = null, sarif = null, config = null, inventory = null;
+            string? target = null, sarif = null, config = null, inventory = null, configuration = null, framework = null;
             bool fail = false, experimentalDirect = false;
             for (int index = 0; index < args.Length; index++)
             {
@@ -207,6 +212,8 @@ internal static class Program
                     case "--fail": fail = true; break;
                     case "--experimental-direct": experimentalDirect = true; break;
                     case "--experimental-inputs": inventory = NextValue(); break;
+                    case "--configuration": configuration = NextValue(); break;
+                    case "--framework": framework = NextValue(); break;
                     default:
                         if (arg.StartsWith("-", StringComparison.Ordinal))
                             throw new ArgumentException($"Unknown option {arg}.");
@@ -218,7 +225,11 @@ internal static class Program
             }
             if (target == null) throw new ArgumentException("A project or solution path is required.");
             if (config != null && !File.Exists(config)) throw new ArgumentException($"Configuration not found: {config}");
-            return new Options(target, sarif, config, fail, experimentalDirect, inventory);
+            if (configuration != null && (string.IsNullOrWhiteSpace(configuration) || configuration.StartsWith('-')))
+                throw new ArgumentException("Provide a nonempty configuration name.");
+            if (framework != null && framework is not ("net8.0" or "net10.0"))
+                throw new ArgumentException("Framework selection currently supports net8.0 and net10.0.");
+            return new Options(target, sarif, config, fail, experimentalDirect, inventory, configuration, framework);
         }
     }
 }

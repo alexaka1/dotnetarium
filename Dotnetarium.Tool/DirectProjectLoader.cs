@@ -12,11 +12,12 @@ namespace Dotnetarium.Tool;
 
 // Experimental input reconstruction. This deliberately does not evaluate
 // MSBuild tasks, execute targets, restore packages, or run source generators.
-internal sealed class DirectProjectLoader(ScanReport report, bool collectPackageInventory = false)
+internal sealed class DirectProjectLoader(ScanReport report, bool collectPackageInventory = false, ScanSelection? selection = null)
 {
     private readonly Dictionary<string, List<ProjectSpec>> specs = new(ProjectLoader.PathComparer);
     private readonly HashSet<string> visited = new(ProjectLoader.PathComparer);
     private readonly List<string> packRoots = FindPackRoots();
+    private readonly ScanSelection selection = selection ?? new();
 
     internal async Task<ScanInputs> LoadAsync(string target)
     {
@@ -24,9 +25,11 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
         var inputs = new ScanInputs(workspace);
         try
         {
-            foreach (var path in ProjectLoader.FindProjects(target)) ReadProject(path);
+            var roots = ProjectLoader.FindProjects(target);
+            foreach (var path in roots) ReadProject(path);
+            var activeSpecs = SelectSpecs(roots);
             var solution = workspace.CurrentSolution;
-            foreach (var spec in specs.Values.SelectMany(value => value))
+            foreach (var spec in activeSpecs)
             {
                 var major = spec.Framework == "net8.0" ? 8 : 10;
                 var symbols = new HashSet<string>(StringComparer.Ordinal)
@@ -36,7 +39,13 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                     "NETCOREAPP2_1_OR_GREATER", "NETCOREAPP2_2_OR_GREATER", "NETCOREAPP3_0_OR_GREATER", "NETCOREAPP3_1_OR_GREATER"
                 };
                 for (var version = 5; version <= major; version++) symbols.Add($"NET{version}_0_OR_GREATER");
-                if (spec.Properties.GetValueOrDefault("Configuration", "Debug").Equals("Debug", StringComparison.OrdinalIgnoreCase)) symbols.Add("DEBUG");
+                if (!IsTrue(spec.Properties.GetValueOrDefault("DisableImplicitConfigurationDefines")))
+                {
+                    var configurationSymbol = spec.Properties.GetValueOrDefault("Configuration", "Debug").ToUpperInvariant()
+                        .Replace('-', '_').Replace('.', '_').Replace(' ', '_');
+                    if (SyntaxFacts.IsValidIdentifier(configurationSymbol)) symbols.Add(configurationSymbol);
+                    else Warn(spec.Path, "configuration-symbol", $"Configuration does not produce a valid C# symbol: {configurationSymbol}");
+                }
                 foreach (var symbol in spec.Properties.GetValueOrDefault("DefineConstants", "").Split(';', StringSplitOptions.RemoveEmptyEntries))
                     symbols.Add(symbol.Trim());
                 var language = major == 8 ? LanguageVersion.CSharp12 : LanguageVersion.CSharp14;
@@ -114,7 +123,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                     ["Platform"] = spec.Properties.GetValueOrDefault("Platform", "AnyCPU")
                 };
             }
-            foreach (var spec in specs.Values.SelectMany(value => value))
+            foreach (var spec in activeSpecs)
             {
                 foreach (var reference in spec.References)
                 {
@@ -159,7 +168,7 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
             var central = FindNearest(root, "Directory.Packages.props");
             if (central != null) documents.Add((central, XDocument.Load(central)));
             documents.Add((path, project));
-            var properties = BaseProperties(root);
+            var properties = ProjectProperties(root);
             properties["MSBuildProjectName"] = Path.GetFileNameWithoutExtension(path);
             properties["MSBuildProjectFullPath"] = path;
             ReadProperties(documents, properties, path);
@@ -171,11 +180,14 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
             {
                 if (framework is not ("net8.0" or "net10.0"))
                 {
-                    Warn(path, "target-framework", $"Unsupported direct-loader framework '{framework}'; skipped this framework.");
-                    report.SkippedProjects.Add($"{path} ({framework})");
+                    if (selection.Framework == null)
+                    {
+                        Warn(path, "target-framework", $"Unsupported direct-loader framework '{framework}'; skipped this framework.");
+                        report.SkippedProjects.Add($"{path} ({framework})");
+                    }
                     continue;
                 }
-                var evaluated = BaseProperties(root);
+                var evaluated = ProjectProperties(root);
                 evaluated["TargetFramework"] = framework;
                 evaluated["MSBuildProjectName"] = Path.GetFileNameWithoutExtension(path);
                 evaluated["MSBuildProjectFullPath"] = path;
@@ -201,7 +213,8 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
                     .Where(value => value.Length > 0).Select(value => Resolve(root, value)).ToArray();
                 specs[path].Add(new(ProjectId.CreateNewId(), path, root, framework, sdk, evaluated, items, references));
             }
-            foreach (var reference in specs[path].SelectMany(spec => spec.References).Distinct()) ReadProject(reference);
+            if (selection.Framework == null)
+                foreach (var reference in specs[path].SelectMany(spec => spec.References).Distinct()) ReadProject(reference);
         }
         catch (Exception error) when (error is IOException or System.Xml.XmlException or NotSupportedException or UnauthorizedAccessException)
         {
@@ -218,6 +231,35 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
         ["MSBuildProjectDirectory"] = root, ["MSBuildThisFileDirectory"] = root + Path.DirectorySeparatorChar
     };
 
+    private Dictionary<string, string> ProjectProperties(string root)
+    {
+        var properties = BaseProperties(root);
+        if (selection.Configuration != null) properties["Configuration"] = selection.Configuration;
+        return properties;
+    }
+
+    private ProjectSpec[] SelectSpecs(string[] roots)
+    {
+        if (selection.Framework == null) return specs.Values.SelectMany(value => value).ToArray();
+        var chosen = roots.Where(specs.ContainsKey).SelectMany(path => specs[path])
+            .Where(spec => spec.Framework == selection.Framework).ToArray();
+        var selected = new Dictionary<ProjectId, ProjectSpec>();
+        var pending = new Queue<ProjectSpec>(chosen);
+        while (pending.TryDequeue(out var spec))
+        {
+            if (!selected.TryAdd(spec.Id, spec)) continue;
+            foreach (var reference in spec.References)
+            {
+                ReadProject(reference);
+                if (specs.TryGetValue(reference, out var candidates) &&
+                    (candidates.FirstOrDefault(candidate => candidate.Framework == spec.Framework) ??
+                     (spec.Framework == "net10.0" ? candidates.FirstOrDefault(candidate => candidate.Framework == "net8.0") : null)) is { } dependency)
+                    pending.Enqueue(dependency);
+            }
+        }
+        return selected.Values.ToArray();
+    }
+
     private void ReadProperties(IEnumerable<(string Path, XDocument Document)> documents,
         Dictionary<string, string> properties, string project, bool preserveFramework = false)
     {
@@ -228,7 +270,9 @@ internal sealed class DirectProjectLoader(ScanReport report, bool collectPackage
             {
                 if (!Condition(group, properties, project)) continue;
                 foreach (var property in group.Elements())
-                    if (!(preserveFramework && property.Name.LocalName == "TargetFramework") && Condition(property, properties, project))
+                    if (!(preserveFramework && property.Name.LocalName == "TargetFramework") &&
+                        !(selection.Configuration != null && property.Name.LocalName.Equals("Configuration", StringComparison.OrdinalIgnoreCase)) &&
+                        Condition(property, properties, project))
                     {
                         var value = Expand(property.Value, properties);
                         if (value.Contains("$(", StringComparison.Ordinal))

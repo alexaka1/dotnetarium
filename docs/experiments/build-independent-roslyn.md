@@ -1,7 +1,7 @@
 # Build-independent Roslyn experiment
 
-Status: direct-loader prototype, input comparison, bounded restore validation
-and explicit generated-C# reuse implemented and locally verified on Windows.
+Status: direct-loader prototype, input comparison, bounded restore validation,
+explicit generated-C# reuse and configuration/framework selection implemented.
 Branch: `experiment/build-independent-roslyn`.
 This work must stay off `main` until its coverage and limitations are reviewed.
 
@@ -32,6 +32,9 @@ symbols with name-based security guesses.
       compilation errors, broken targets, missing references, generated code,
       mixed solutions, environment/debug guards, and interface dispatch.
 - [x] Compare project-aware and direct modes on SharpSaster and Razor/gRPC cases.
+- [x] Select configuration and root framework explicitly; retain compatible source
+      dependencies and configuration-specific generated output.
+- [x] Measure custom imports/build workflows and an SDK-pinned real project.
 - [x] Record measured results, gaps, and the next experiment in this document.
 
 ## Experiment boundaries
@@ -328,7 +331,12 @@ assets provided the package/version, high severity, advisory URL and `net10.0`
 target; the experimental inventory retained those fields despite an empty C#
 project. This fixture package is not added to Dotnetarium's dependencies.
 
-### Recommended next SCA slice
+### Deferred SCA spinoff
+
+SCA is a separate follow-up after the main loading experiment is concluded.
+The existing dependency snapshot is diagnostic evidence, not a vulnerability
+scanner. Advisory lookup and reachability implementation are outside the current
+experiment. The following is the proposed scope for that future work:
 
 1. Consume NuGet's `VulnerabilityInfo` API against resolved package versions,
    using official NuGet version/range semantics. Its bulk pages allow local
@@ -384,8 +392,9 @@ suppression policy must remain visible when reporting coverage.
   Package build-time inputs are reported when present. Properties such as
   `IsTestProject` are only reconstructed from the supported project/props files;
   values contributed by package imports may differ from project-aware loading.
-- Compilation defaults follow Debug configuration. More configuration/platform
-  selections and SDK-specific compiler properties need explicit coverage.
+- Default configuration remains Debug. Explicit configuration and root-framework
+  selection are covered below. Platform selection and more SDK-specific compiler
+  properties still need coverage.
 - Generated code is not recreated. Default `obj`/`bin` exclusions avoid consuming
   stale code; existing generated C# must be selected explicitly with compile
   items. Dependency-provided analyzer/generator assemblies are not executed.
@@ -396,6 +405,61 @@ suppression policy must remain visible when reporting coverage.
   body was analyzed. Unsupported operations and unresolved calls retain the
   engine's existing behavior; absence of findings in a partial scan is not a
   clean bill of health.
+
+## Configuration and framework selection
+
+Both loaders accept an explicit configuration and framework:
+
+```sh
+dotnetarium path/to/App.csproj --configuration Release --framework net10.0 --experimental-direct --sarif findings.sarif --experimental-inputs inputs.json
+```
+
+- `--configuration` is a global property. Supported simple property/item
+  conditions, symbols, optimization and test-project metadata use that value.
+  Custom names are accepted. SDK configuration symbols are reconstructed with
+  the SDK's uppercase and punctuation substitutions; disabling implicit
+  configuration defines is respected. The inventory distinguishes the requested
+  selection from effective project metadata, which is not always exported by
+  project-aware loading.
+- `--framework` selects root compilations, then retains their source dependency
+  closure. A `net10.0` root may therefore retain a `net8.0` dependency. It does not
+  override every project's `TargetFramework`. Current choices are `net8.0` and
+  `net10.0`; omitting the option retains the existing all-framework behavior.
+- Missing requested root frameworks produce a coverage notice. Other eligible
+  solution roots still scan; no eligible compilation returns exit 2. The direct
+  loader does not read source/package inputs or recurse through dependencies
+  belonging only to intentionally unselected frameworks. Project-aware loading
+  opens the workspace before selection and can still report loading failures
+  from other frameworks.
+- Explicit generated output uses the selected configuration/TFM's
+  `IntermediateOutputPath`. Nothing is generated or refreshed by direct loading.
+
+CLI fixtures compare complete findings and engine flows for Debug, Release and
+a custom test configuration. They cover conditional compile items/constants,
+test metadata, lower-framework dependencies, unavailable roots, mixed solutions,
+configuration-specific output reuse and custom target nonexecution. A controlled
+custom import supplies an extra sink: project-aware Release loading reports both
+sinks, direct loading preserves the independent sink and reports partial coverage
+for the omitted import. This is an expected input gap, not finding parity.
+
+## Additional real-project evidence
+
+Measured on 2026-10-04 with explicit Release selection:
+
+| Project | Selection | Result | Interpretation |
+| --- | --- | --- | --- |
+| SharpSaster, locally upgraded corpus | `net10.0` | 41 identical complete SARIF results, including engine flows, in project-aware/direct modes | Configuration selection preserves existing findings; direct mode still reports omitted generation |
+| HelveticOps Application + Domain, commit `49dd07b` | `net8.0` | 2 compilations, 0 findings, no coverage notices, no assets/restore/build | Shared `Directory.Build.props`, framework-only source reference and an SDK-8-pinned repository scan using available reference packs |
+| LANCommander UI + SDK + Steam, commit `4a2eef7`, locally upgraded UI corpus | `net10.0` | 3 compilations, partial coverage | Real custom npm/completion targets are not run; omitted package bindings and generated inputs prevent a clean conclusion |
+
+LANCommander demonstrates a concrete remaining dependency gap: a source
+dependency's framework package pruning makes the parent restore graph unverified.
+The loader conservatively omits cached parent package bindings, producing many
+unresolved symbols. Zero findings in this case do not establish absence of
+vulnerabilities, and no equivalence with a full project-aware scan is claimed.
+The custom-import fixture separately demonstrates an actual missed finding when
+an imported file is unavailable. These cases argue against silently promoting
+the prototype to the default or treating an automatic fallback as equivalent.
 
 ## Next experiment and promotion gates
 
@@ -412,12 +476,15 @@ suppression policy must remain visible when reporting coverage.
    real Razor/gRPC positive and safe cases, mapped SARIF and target nonexecution.
    Evaluate controlled SDK generation separately, without arbitrary custom
    target execution. Source-generator policy remains a separate decision.
-4. Extend the real-project corpus with custom imports and build workflows.
-   Review false positives as well as missed findings and unresolved bindings.
+4. **Selection/corpus slice complete:** configuration/framework selection and
+   real custom-build/SDK-pinned projects. Custom-import source omissions and
+   framework package pruning remain explicit coverage gaps. Before production
+   promotion, validate common pruning/asset propagation and decide whether to
+   support bounded imports or keep them as an explicit partial-coverage boundary.
 5. Require passing Windows/Linux CI and repeatable finding/flow comparisons
    before considering automatic fallback or a default-loading change.
 
-The direct prototype, inventory, bounded validation and explicit reuse slices are
-complete. Production promotion, automatic fallback,
+The direct prototype, inventory, bounded validation, explicit reuse and selection
+slices are complete. Production promotion, automatic fallback,
 full import evaluation and generation support are intentionally not complete.
 No release or merge into `main` is part of this work.

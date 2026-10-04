@@ -9,7 +9,7 @@ namespace Dotnetarium.Tool;
 
 // An opt-in diagnostic artifact, separate from SARIF findings. Capture the
 // compilation used by the engine; do not load additional projects or generators.
-internal sealed class CompilationInputInventory(string target, bool direct)
+internal sealed class CompilationInputInventory(string target, bool direct, ScanSelection selection)
 {
     private readonly string root = Path.GetDirectoryName(target)!;
     private readonly List<object> projects = [];
@@ -125,6 +125,7 @@ internal sealed class CompilationInputInventory(string target, bool direct)
             schemaVersion = 1,
             target = Relative(target),
             loadingMode = direct ? "direct" : "project",
+            selection = new { configuration = selection.Configuration, framework = selection.Framework },
             projects,
             // Dependency evidence survives even if a project has no usable
             // compilation. This snapshot does not perform an advisory lookup.

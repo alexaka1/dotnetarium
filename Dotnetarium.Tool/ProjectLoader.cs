@@ -14,8 +14,9 @@ internal sealed class ScanInputs(Workspace workspace, string? msbuildPath = null
     internal Dictionary<ProjectId, Dictionary<string, string>> InputProperties { get; } = [];
     internal Dictionary<ProjectId, RestoredAssetsState> RestoredAssets { get; } = [];
     internal Dictionary<ProjectId, RestoredPackageInventory> PackageInventories { get; } = [];
+    internal HashSet<ProjectId>? SelectedProjects { get; set; }
     internal IEnumerable<Project> Projects => Workspace.CurrentSolution.Projects
-        .Where(project => project.Language == LanguageNames.CSharp);
+        .Where(project => project.Language == LanguageNames.CSharp && (SelectedProjects == null || SelectedProjects.Contains(project.Id)));
     public void Dispose() => Workspace.Dispose();
 }
 
@@ -44,14 +45,16 @@ internal static class ProjectLoader
             .Distinct(PathComparer).ToArray();
     }
 
-    internal static async Task<ScanInputs> LoadProjectAwareAsync(string target, ScanReport report)
+    internal static async Task<ScanInputs> LoadProjectAwareAsync(string target, ScanReport report, ScanSelection selection)
     {
         var query = VisualStudioInstanceQueryOptions.Default;
         query.WorkingDirectory = Path.GetDirectoryName(target)!;
         var sdk = MSBuildLocator.QueryVisualStudioInstances(query).FirstOrDefault() ??
             throw new InvalidOperationException("No compatible .NET SDK was found.");
         MSBuildLocator.RegisterInstance(sdk);
-        var workspace = MSBuildWorkspace.Create();
+        var globals = new Dictionary<string, string>();
+        if (selection.Configuration != null) globals["Configuration"] = selection.Configuration;
+        var workspace = MSBuildWorkspace.Create(globals);
         var inputs = new ScanInputs(workspace, sdk.MSBuildPath);
         workspace.RegisterWorkspaceFailedHandler(diagnostic =>
             report.Warn("workspace", diagnostic.Diagnostic.Message));
