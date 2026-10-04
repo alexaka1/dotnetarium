@@ -1,6 +1,7 @@
 # Build-independent Roslyn experiment
 
-Status: first prototype implemented and locally verified on Windows.
+Status: first prototype and compilation-input comparison implemented and locally
+verified on Windows.
 Branch: `experiment/build-independent-roslyn`.
 This work must stay off `main` until its coverage and limitations are reviewed.
 
@@ -79,8 +80,83 @@ configuration errors, and .NET 8/10.
 
 Internal analyzer exceptions remain failures rather than successful partial
 scans. This handling was reviewed; no artificial analyzer crash was injected.
-Windows and Linux CI checks are enabled for this experimental branch. Remote CI
-results are separate from the local verification above.
+Windows and Linux CI checks are enabled for this experimental branch. The first
+remote run passed Linux; Windows failed before scanning because the workflow had
+not built the tool DLL. The Windows workflow now builds it before the experiment,
+and both jobs retain inventories, SARIF and logs, including after failed checks.
+Remote CI results are separate from the local verification above.
+
+## Compilation-input comparison
+
+The optional `--experimental-inputs <path>` exports a versioned JSON inventory
+from the exact compilations passed to the analyzers. It does not change analyzer
+execution or authorize extra generation. The inventory records:
+
+- Included syntax trees, UTF-8 text hashes and each tree's parse settings.
+- Regular documents, synthesized implicit usings and source-generator output.
+  Files under `obj`/`bin` or with conventional generated names are marked as
+  generated candidates; that marker alone is not proof of their provenance.
+- Bound assembly identities and versions, physical reference paths, source
+  project references, target frameworks, aliases and interop settings.
+- Effective language version, conditional symbols, compiler features, nullable,
+  output kind, optimization, platform, overflow and diagnostic options.
+- Analyzer configs, additional-file hashes, analyzer/generator assembly paths,
+  test-project metadata, coverage notices and skipped projects.
+
+Paths are relative to the target directory where possible. Source/configuration
+contents are not copied into the inventory. Configuration/platform property names
+are null when the workspace does not expose them; effective compiler settings
+are recorded regardless. A framework inferred from conditional symbols is
+explicitly labeled, and ambiguous symbols are not treated as authoritative TFM
+metadata. Compare inventories from the same checkout and target directory.
+
+The comparison script pairs projects by path and TFM, compares reference
+identities and aliases rather than cache locations, and reports generated inputs
+separately from user source. Differences are evidence to investigate, not a
+scan failure or proof that a finding was missed.
+
+Measured locally on 2026-10-04 after the fixes below:
+
+| Corpus/project | User C# trees, both modes | Generated candidates, project/direct | Bound references, both modes | Findings, project/direct |
+| --- | --- | --- | --- | --- |
+| SharpSaster | 17 | 5 / 1 | 327 | 41 / 41 |
+| Razor server | 2 | 7 / 1 | 310 | 3 / 3 across server/client |
+| Blazor client | 2 | 5 / 1 | 193 | Included above |
+| Existing gRPC corpus | 2 | 6 / 1 | 314 | 0 / 0; no positive security sink in this corpus |
+
+User source text and complete finding/flow sets match in these comparisons.
+The separate real-provider gRPC positive fixture still yields the same command
+finding in both modes. Equal reference counts do not establish identity parity:
+the Razor server's client project reference has version `2.3.0.0` in project mode
+and `0.0.0.0` in direct mode because assembly-version attributes are not generated.
+
+The inventory exposed and the expanded CLI suite verifies these fixes:
+
+- Honor explicit optimization, overflow checking, platform, warning level,
+  unsafe-code and documentation settings; preserve Windows application output
+  kind separately from console output.
+- Preserve aliases and interop metadata on explicit `Reference`/`HintPath` and
+  source project references, with real protobuf assembly and `extern alias` tests.
+- Exclude `ReferenceOutputAssembly=false` build-order dependencies from semantic
+  project references instead of analyzing them as ordinary dependencies.
+- Capture actual SDK regex-generator output in project mode. Direct mode does
+  not invent it; unresolved generated partial methods remain coverage warnings,
+  while unrelated findings and witnesses survive.
+
+Remaining measured differences include generated assembly attributes, SDK
+analyzer configuration, compiler diagnostic defaults, interceptor features,
+package analyzer/generator assemblies, and SDK-selected additional files. Blank
+test-project metadata versus explicit `false` is visible too; it is not evidence
+of different TLS suppression behavior by itself.
+
+The gRPC comparison includes generated protobuf/service C# in project mode and
+not in direct mode. The Razor project-aware CLI compilation also lacks generated
+page/component C# in this fixture: it includes markup as additional files, while
+direct mode omits those SDK-selected files. Neither result is evidence of complete
+Razor coverage. Full package-build Razor smoke remains the coverage reference.
+
+Both modes retain the same known engine limitations. Do not promote this loader
+based only on matching finding counts.
 
 ## Running the experiment
 
@@ -109,6 +185,14 @@ Run the fixture suite after building the tool:
 ./tests/BuildIndependentSmoke/Test.ps1
 ```
 
+Export and compare compilation inputs:
+
+```powershell
+dotnet Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll path/to/App.csproj --experimental-inputs project-inputs.json --sarif project.sarif
+dotnet Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll path/to/App.csproj --experimental-direct --experimental-inputs direct-inputs.json --sarif direct.sarif
+./tests/BuildIndependentSmoke/Compare-Inputs.ps1 -ProjectInventory project-inputs.json -DirectInventory direct-inputs.json -OutputPath comparison.json
+```
+
 ## Known prototype limitations
 
 - Only conventional SDK projects with exact `net8.0` and `net10.0` TFMs are
@@ -121,7 +205,8 @@ Run the fixture suite after building the tool:
 - Package compile references come from existing `project.assets.json` and its
   package folders. No dependency version is guessed or silently downloaded.
   Reference packs can also be read from the local NuGet cache. Assets freshness,
-  richer package metadata, aliases, and build-time assets need further work.
+  richer package metadata, package-provided aliases, and build-time assets need further work.
+  Explicit assembly/source project aliases and interop metadata are supported.
   Package build-time inputs are reported when present. Properties such as
   `IsTestProject` are only reconstructed from the supported project/props files;
   values contributed by package imports may differ from project-aware loading.
@@ -140,9 +225,10 @@ Run the fixture suite after building the tool:
 
 ## Next experiment and promotion gates
 
-1. Add a compilation-input inventory with resolved references, included sources,
-   generated inputs, target framework and configuration. Compare it against the
-   project-aware loader before expanding reconstruction rules.
+1. **Complete:** compilation-input inventory and comparison, including resolved
+   references, included sources, generated inputs, effective compiler settings
+   and available target-framework/configuration metadata. Measured settings and
+   reference-metadata discrepancies are fixed and covered by CLI fixtures.
 2. Validate assets freshness and more source/reference/configuration metadata.
    Fix measured discrepancies while keeping unknown inputs visible.
 3. Reuse explicitly supplied generated C# and measure Razor/gRPC coverage. Then
@@ -153,6 +239,6 @@ Run the fixture suite after building the tool:
 5. Require passing Windows/Linux CI and repeatable finding/flow comparisons
    before considering automatic fallback or a default-loading change.
 
-The first experiment is complete. Production promotion, automatic fallback,
+The first experiment and input-inventory step are complete. Production promotion, automatic fallback,
 full import evaluation and generation support are intentionally not complete.
 No release or merge into `main` is part of this work.

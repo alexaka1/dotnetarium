@@ -2,7 +2,9 @@ param([string]$ToolDll)
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 if (-not $ToolDll) { $ToolDll = Join-Path $root 'Dotnetarium.Tool/bin/Release/net10.0/Dotnetarium.Tool.dll' }
-$scratch = Join-Path ([System.IO.Path]::GetTempPath()) ('dotnetarium-direct-' + [guid]::NewGuid().ToString('N'))
+if (-not (Test-Path -LiteralPath $ToolDll)) { throw "Build the tool before running this suite: $ToolDll" }
+$reportsRoot = if ($env:DOTNETARIUM_EXPERIMENT_REPORTS) { $env:DOTNETARIUM_EXPERIMENT_REPORTS } else { [System.IO.Path]::GetTempPath() }
+$scratch = Join-Path $reportsRoot ('dotnetarium-direct-' + [guid]::NewGuid().ToString('N'))
 $projectRoot = Join-Path $scratch 'app'
 New-Item -ItemType Directory -Path $projectRoot -Force | Out-Null
 $project = Join-Path $projectRoot 'App.csproj'
@@ -50,7 +52,8 @@ function Scan([string]$Target, [bool]$Direct, [int]$ExpectedExit = 0, [bool]$Fai
     $script:scanIndex++
     $sarif = Join-Path $scratch "scan-$script:scanIndex.sarif"
     $log = Join-Path $scratch "scan-$script:scanIndex.log"
-    $arguments = @($ToolDll, $Target, '--sarif', $sarif)
+    $inventory = Join-Path $scratch "scan-$script:scanIndex.inputs.json"
+    $arguments = @($ToolDll, $Target, '--sarif', $sarif, '--experimental-inputs', $inventory)
     if ($Direct) { $arguments += '--experimental-direct' }
     if ($Fail) { $arguments += '--fail' }
     & dotnet @arguments > $log 2>&1
@@ -58,7 +61,9 @@ function Scan([string]$Target, [bool]$Direct, [int]$ExpectedExit = 0, [bool]$Fai
         Get-Content -LiteralPath $log | Write-Host
         throw "Unexpected scan exit/output: $Target (direct=$Direct, expected=$ExpectedExit, actual=$LASTEXITCODE)"
     }
-    return (Get-Content -LiteralPath $sarif -Raw | ConvertFrom-Json)
+    $report = Get-Content -LiteralPath $sarif -Raw | ConvertFrom-Json
+    $report | Add-Member -NotePropertyName inputInventory -NotePropertyValue (Get-Content -LiteralPath $inventory -Raw | ConvertFrom-Json)
+    return $report
 }
 function Findings($Report) {
     return @($Report.runs[0].results | ForEach-Object {
@@ -84,6 +89,17 @@ if ($ids.Count -ne 3 -or $ids -notcontains 'DNA0002' -or $ids -notcontains 'DNA0
     throw ('Unexpected positive/negative baseline: ' + ($ids -join ', '))
 }
 if ($direct.runs[0].invocations[0].properties.'dotnetarium.coverage' -ne 'complete') { throw 'Clean direct scan should have complete reconstructed inputs.' }
+$inputBaseline = $baseline.inputInventory.projects[0]
+$inputDirect = $direct.inputInventory.projects[0]
+if ($inputDirect.targetFramework -ne 'net10.0' -or $inputDirect.configuration -ne 'Debug' -or
+    $inputDirect.parse.languageVersion -ne '14.0' -or $inputDirect.parse.symbols -notcontains 'DEBUG' -or
+    @($inputDirect.sources | Where-Object origin -eq 'synthesized-usings').Count -ne 1) { throw 'Input inventory omitted effective settings or synthesized inputs.' }
+if (Compare-Object $inputBaseline.references.identity $inputDirect.references.identity) { throw 'Framework assembly identities differ.' }
+if (($inputBaseline.sources | Where-Object path -eq 'Inputs.cs').sha256 -ne
+    ($inputDirect.sources | Where-Object path -eq 'Inputs.cs').sha256) { throw 'User source inventory differs.' }
+$comparison = & (Join-Path $PSScriptRoot 'Compare-Inputs.ps1') -ProjectInventory (Join-Path $scratch 'scan-1.inputs.json') -DirectInventory (Join-Path $scratch 'scan-2.inputs.json') -OutputPath (Join-Path $scratch 'baseline-comparison.json')
+if ($comparison.projects.Count -ne 1 -or $comparison.projects[0].status -ne 'different' -or
+    -not $comparison.projects[0].differences.generatedSources) { throw 'Comparison hid generated SDK input differences.' }
 
 'class Broken { MissingType field; }' | Set-Content -LiteralPath (Join-Path $projectRoot 'Broken.cs')
 $partial = Scan $project $true
@@ -235,6 +251,32 @@ if (@($frameworkDirect.runs[0].results).Count -ne 2 -or
     @($frameworkDirect.runs[0].invocations[0].properties.'dotnetarium.analyzedProjects').Count -ne 4 -or
     (HasNotice $frameworkDirect 'compiler-error')) { throw 'Direct multi-framework compilation/reference/source selection failed.' }
 
+# The source project reference must carry aliases too, without combining
+# separate target frameworks into one compilation.
+$frameworkText = Get-Content -LiteralPath $frameworkProject -Raw
+$frameworkText.Replace('<ProjectReference Include="../contracts/Contracts.csproj" />', '<ProjectReference Include="../contracts/Contracts.csproj" Aliases="dto" />') |
+    Set-Content -LiteralPath $frameworkProject
+$frameworkSource = Get-Content -LiteralPath (Join-Path $frameworkRoot 'Frameworks.cs') -Raw
+('extern alias dto;' + [Environment]::NewLine + $frameworkSource.Replace('Safe(Contract value)', 'Safe(dto::Contract value)')) |
+    Set-Content -LiteralPath (Join-Path $frameworkRoot 'Frameworks.cs')
+$aliasAware = Scan $frameworkProject $false
+$aliasDirect = Scan $frameworkProject $true
+SameFindings $aliasAware $aliasDirect
+if ((HasNotice $aliasDirect 'compiler-error') -or
+    @($aliasDirect.inputInventory.projects | Where-Object { $_.path -eq 'Frameworks.csproj' } | ForEach-Object {
+        $_.projectReferences | Where-Object { $_.aliases -contains 'dto' }
+    }).Count -ne 2) { throw 'Aliased project reference bindings were lost.' }
+
+# ReferenceOutputAssembly=false is build ordering, not a semantic dependency.
+$frameworkText.Replace('<ProjectReference Include="../contracts/Contracts.csproj" />', '<ProjectReference Include="../contracts/Contracts.csproj" ReferenceOutputAssembly="false" />') |
+    Set-Content -LiteralPath $frameworkProject
+$frameworkSource.Replace('public static string Safe(Contract value) => value.Value;', '') |
+    Set-Content -LiteralPath (Join-Path $frameworkRoot 'Frameworks.cs')
+$buildOnly = Scan $frameworkProject $true
+if ($buildOnly.inputInventory.projects.Count -ne 2 -or
+    @($buildOnly.inputInventory.projects | ForEach-Object projectReferences).Count -ne 0 -or
+    (HasNotice $buildOnly 'compiler-error')) { throw 'Build-only project reference was incorrectly analyzed as a dependency.' }
+
 # Interface dispatch must preserve both registered unsafe and safe cases.
 $diRoot = Join-Path $scratch 'di'
 New-Item -ItemType Directory -Path $diRoot | Out-Null
@@ -307,5 +349,66 @@ $grpcDirect = Scan $grpcProject $true
 SameFindings $grpcAware $grpcDirect
 if (@($grpcDirect.runs[0].results | Where-Object ruleId -eq 'DNA0002').Count -ne 1 -or
     (HasNotice $grpcDirect 'compiler-error')) { throw 'Real gRPC entry point or safe metadata handling regressed.' }
+
+# Explicit compiler options and a real assembly with an extern alias expose
+# input reconstruction errors that a findings-only comparison can miss.
+$settingsRoot = Join-Path $scratch 'settings'
+New-Item -ItemType Directory -Path $settingsRoot | Out-Null
+$settingsProject = Join-Path $settingsRoot 'Settings.csproj'
+$protobufAssembly = @($grpcDirect.inputInventory.projects[0].references | Where-Object { $_.identity -like 'Google.Protobuf,*' })[0].path
+$protobufAssembly = [IO.Path]::GetFullPath((Join-Path $grpcRoot $protobufAssembly))
+$escapedAssembly = [System.Security.SecurityElement]::Escape($protobufAssembly)
+@"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework><Optimize>true</Optimize><CheckForOverflowUnderflow>true</CheckForOverflowUnderflow><AllowUnsafeBlocks>true</AllowUnsafeBlocks><PlatformTarget>x64</PlatformTarget><WarningLevel>7</WarningLevel><GenerateDocumentationFile>true</GenerateDocumentationFile></PropertyGroup>
+  <ItemGroup><Reference Include="Google.Protobuf"><HintPath>$escapedAssembly</HintPath><Aliases>proto</Aliases></Reference></ItemGroup>
+</Project>
+"@ | Set-Content -LiteralPath $settingsProject
+@'
+extern alias proto;
+public static class Settings
+{
+    public static string Value(proto::Google.Protobuf.WellKnownTypes.StringValue input) => input.Value;
+    public static void Unsafe() => System.Diagnostics.Process.Start(System.Console.ReadLine());
+}
+'@ | Set-Content -LiteralPath (Join-Path $settingsRoot 'Settings.cs')
+& dotnet restore $settingsProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Settings fixture restore failed.' }
+$settingsAware = Scan $settingsProject $false
+$settingsDirect = Scan $settingsProject $true
+SameFindings $settingsAware $settingsDirect
+$awareOptions = $settingsAware.inputInventory.projects[0]
+$directOptions = $settingsDirect.inputInventory.projects[0]
+foreach ($setting in @('optimizationLevel', 'platform', 'allowUnsafe', 'checkOverflow', 'warningLevel')) {
+    if ($awareOptions.compilation.$setting -ne $directOptions.compilation.$setting) { throw "Compiler option mismatch: $setting" }
+}
+if ($awareOptions.parse.documentationMode -ne $directOptions.parse.documentationMode -or
+    (HasNotice $settingsDirect 'compiler-error') -or
+    ($directOptions.references | Where-Object { $_.identity -like 'Google.Protobuf,*' }).aliases -notcontains 'proto') { throw 'Explicit reference alias or parse settings were lost.' }
+
+# The inventory must contain actual generator trees seen by Roslyn. The
+# direct loader reports unresolved partial methods instead of inventing them.
+$generatorRoot = Join-Path $scratch 'generator'
+New-Item -ItemType Directory -Path $generatorRoot | Out-Null
+$generatorProject = Join-Path $generatorRoot 'Generator.csproj'
+$original | Set-Content -LiteralPath $generatorProject
+Copy-Item -LiteralPath (Join-Path $projectRoot 'Inputs.cs') -Destination $generatorRoot
+@'
+using System.Text.RegularExpressions;
+public static partial class Regexes
+{
+    [GeneratedRegex("^safe$")]
+    public static partial Regex Get();
+}
+'@ | Set-Content -LiteralPath (Join-Path $generatorRoot 'Regexes.cs')
+& dotnet restore $generatorProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Generator fixture restore failed.' }
+$generatorAware = Scan $generatorProject $false
+$generatorDirect = Scan $generatorProject $true
+SameFindings $baseline $generatorAware
+SameFindings $baseline $generatorDirect
+if (@($generatorAware.inputInventory.projects[0].sources | Where-Object origin -eq 'source-generator').Count -eq 0 -or
+    @($generatorDirect.inputInventory.projects[0].sources | Where-Object origin -eq 'source-generator').Count -ne 0 -or
+    (HasNotice $generatorAware 'compiler-error') -or -not (HasNotice $generatorDirect 'compiler-error')) { throw 'Source-generator input gap was not measured accurately.' }
 
 "Build-independent CLI checks passed. Reports and logs: $scratch" | Write-Output

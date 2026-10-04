@@ -25,7 +25,23 @@ jobs:
         run: dotnet run --project tests/ModernSinkSmoke/ModernSinkSmoke.csproj -c Release -p:RunAnalyzers=false
       - name: Test build-independent Roslyn experiment
         shell: pwsh
-        run: ./tests/BuildIndependentSmoke/Test.ps1
+        env:
+          DOTNETARIUM_EXPERIMENT_REPORTS: ${{ runner.temp }}
+        run: |
+          dotnet build Dotnetarium.Tool/Dotnetarium.Tool.csproj -c Release -p:RunAnalyzers=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./tests/BuildIndependentSmoke/Test.ps1
+      - name: Upload experimental input comparisons
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roslyn-inputs-windows
+          path: |
+            ${{ runner.temp }}/dotnetarium-direct-*/*.json
+            ${{ runner.temp }}/dotnetarium-direct-*/*.sarif
+            ${{ runner.temp }}/dotnetarium-direct-*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Test Razor and Blazor flows
         shell: pwsh
         run: ./tests/RazorSmoke/Test.ps1
@@ -62,7 +78,20 @@ jobs:
           dotnet pack Dotnetarium.Tool/Dotnetarium.Tool.csproj -c Release -p:RunAnalyzers=false -o artifacts
       - name: Test build-independent Roslyn experiment
         shell: pwsh
+        env:
+          DOTNETARIUM_EXPERIMENT_REPORTS: ${{ runner.temp }}
         run: ./tests/BuildIndependentSmoke/Test.ps1
+      - name: Upload experimental input comparisons
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: roslyn-inputs-linux
+          path: |
+            ${{ runner.temp }}/dotnetarium-direct-*/*.json
+            ${{ runner.temp }}/dotnetarium-direct-*/*.sarif
+            ${{ runner.temp }}/dotnetarium-direct-*/*.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Scan with lowercase project config
         shell: pwsh
         run: ./tests/CliSmoke/Test.ps1

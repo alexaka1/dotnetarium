@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -53,14 +54,43 @@ internal sealed class DirectProjectLoader(ScanReport report)
                 };
                 var output = spec.Properties.GetValueOrDefault("OutputType",
                     spec.Sdk is "Microsoft.NET.Sdk.Web" or "Microsoft.NET.Sdk.BlazorWebAssembly" ? "Exe" : "Library");
-                var compilationOptions = new CSharpCompilationOptions(output.Equals("Exe", StringComparison.OrdinalIgnoreCase) ||
-                    output.Equals("WinExe", StringComparison.OrdinalIgnoreCase) ? OutputKind.ConsoleApplication : OutputKind.DynamicallyLinkedLibrary,
-                    nullableContextOptions: nullable, allowUnsafe: IsTrue(spec.Properties.GetValueOrDefault("AllowUnsafeBlocks")));
+                var outputKind = output.ToLowerInvariant() switch
+                {
+                    "exe" => OutputKind.ConsoleApplication,
+                    "winexe" => OutputKind.WindowsApplication,
+                    "library" => OutputKind.DynamicallyLinkedLibrary,
+                    _ => OutputKind.DynamicallyLinkedLibrary
+                };
+                if (!new[] { "exe", "winexe", "library" }.Contains(output.ToLowerInvariant()))
+                    Warn(spec.Path, "compiler-property", $"Unsupported OutputType '{output}'; using Library.");
+                var platformName = spec.Properties.GetValueOrDefault("PlatformTarget", "AnyCPU");
+                if (!Enum.TryParse<Platform>(platformName, true, out var platform) || !Enum.IsDefined(platform))
+                {
+                    Warn(spec.Path, "compiler-property", $"Unsupported PlatformTarget '{platformName}'; using AnyCPU.");
+                    platform = Platform.AnyCpu;
+                }
+                var warningLevel = major;
+                if (spec.Properties.TryGetValue("WarningLevel", out var warning) &&
+                    (!int.TryParse(warning, out warningLevel) || warningLevel < 0))
+                {
+                    Warn(spec.Path, "compiler-property", $"Unsupported WarningLevel '{warning}'; using {major}.");
+                    warningLevel = major;
+                }
+                var optimize = spec.Properties.TryGetValue("Optimize", out var optimization) ? IsTrue(optimization) :
+                    spec.Properties.GetValueOrDefault("Configuration", "Debug").Equals("Release", StringComparison.OrdinalIgnoreCase);
+                var compilationOptions = new CSharpCompilationOptions(outputKind,
+                    nullableContextOptions: nullable, allowUnsafe: IsTrue(spec.Properties.GetValueOrDefault("AllowUnsafeBlocks")),
+                    optimizationLevel: optimize ? OptimizationLevel.Release : OptimizationLevel.Debug,
+                    checkOverflow: IsTrue(spec.Properties.GetValueOrDefault("CheckForOverflowUnderflow")),
+                    platform: platform, warningLevel: warningLevel);
                 solution = solution.AddProject(ProjectInfo.Create(spec.Id, VersionStamp.Create(),
                     $"{Path.GetFileNameWithoutExtension(spec.Path)} ({spec.Framework})",
                     spec.Properties.GetValueOrDefault("AssemblyName", Path.GetFileNameWithoutExtension(spec.Path)), LanguageNames.CSharp,
                     filePath: spec.Path, compilationOptions: compilationOptions,
-                    parseOptions: new CSharpParseOptions(language, preprocessorSymbols: symbols),
+                    parseOptions: new CSharpParseOptions(language,
+                        documentationMode: IsTrue(spec.Properties.GetValueOrDefault("GenerateDocumentationFile")) ||
+                            !string.IsNullOrEmpty(spec.Properties.GetValueOrDefault("DocumentationFile")) ? DocumentationMode.Diagnose : DocumentationMode.Parse,
+                        preprocessorSymbols: symbols),
                     metadataReferences: ReadReferences(spec)));
                 foreach (var source in ReadSources(spec))
                     solution = solution.AddDocument(DocumentId.CreateNewId(spec.Id), Path.GetFileName(source),
@@ -77,6 +107,12 @@ internal sealed class DirectProjectLoader(ScanReport report)
                         solution = solution.AddAdditionalDocument(DocumentId.CreateNewId(spec.Id), Path.GetFileName(file),
                             SourceText.From(await File.ReadAllTextAsync(file)), filePath: file);
                 inputs.TestProjectMetadata[spec.Id] = spec.Properties.GetValueOrDefault("IsTestProject", "false");
+                inputs.InputProperties[spec.Id] = new(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["TargetFramework"] = spec.Framework,
+                    ["Configuration"] = spec.Properties.GetValueOrDefault("Configuration", "Debug"),
+                    ["Platform"] = spec.Properties.GetValueOrDefault("Platform", "AnyCPU")
+                };
             }
             foreach (var spec in specs.Values.SelectMany(value => value))
             {
@@ -94,7 +130,10 @@ internal sealed class DirectProjectLoader(ScanReport report)
                         Warn(spec.Path, "project-reference", $"No compatible framework for project reference: {reference}");
                         continue;
                     }
-                    try { solution = solution.AddProjectReference(spec.Id, new ProjectReference(dependency.Id)); }
+                    var item = spec.Items.First(item => item.Name.LocalName == "ProjectReference" &&
+                        ProjectLoader.PathComparer.Equals(Resolve(spec.Root, Expand((string?)item.Attribute("Include") ?? "", spec.Properties)), reference));
+                    var metadata = ReferenceProperties(item, spec.Properties);
+                    try { solution = solution.AddProjectReference(spec.Id, new ProjectReference(dependency.Id, metadata.Aliases, metadata.EmbedInteropTypes)); }
                     catch (InvalidOperationException error) { Warn(spec.Path, "project-reference", error.Message); }
                 }
             }
@@ -148,6 +187,7 @@ internal sealed class DirectProjectLoader(ScanReport report)
                 if (FindNearest(root, "Directory.Build.targets") is { } targets)
                     Warn(path, "import", $"Directory.Build.targets was not evaluated: {targets}");
                 var references = items.Where(item => item.Name.LocalName == "ProjectReference")
+                    .Where(item => !IsFalse(Expand(ItemMetadata(item, "ReferenceOutputAssembly") ?? "true", evaluated)))
                     .Select(item => Expand((string?)item.Attribute("Include") ?? "", evaluated))
                     .Where(value => value.Length > 0).Select(value => Resolve(root, value)).ToArray();
                 specs[path].Add(new(ProjectId.CreateNewId(), path, root, framework, sdk, evaluated, items, references));
@@ -209,6 +249,7 @@ internal sealed class DirectProjectLoader(ScanReport report)
     private List<MetadataReference> ReadReferences(ProjectSpec spec)
     {
         var paths = new HashSet<string>(ProjectLoader.PathComparer);
+        var hints = new Dictionary<string, MetadataReferenceProperties>(ProjectLoader.PathComparer);
         AddPack("Microsoft.NETCore.App.Ref", spec.Framework, spec.Path, paths);
         if (spec.Sdk == "Microsoft.NET.Sdk.Web" || spec.Items.Any(item => item.Name.LocalName == "FrameworkReference" &&
             (string?)item.Attribute("Include") == "Microsoft.AspNetCore.App"))
@@ -218,9 +259,14 @@ internal sealed class DirectProjectLoader(ScanReport report)
             Warn(spec.Path, "framework-reference", $"Unsupported framework reference: {(string?)item.Attribute("Include")}");
         foreach (var item in spec.Items.Where(item => item.Name.LocalName == "Reference"))
         {
-            var hint = item.Elements().FirstOrDefault(element => element.Name.LocalName == "HintPath")?.Value;
+            var hint = ItemMetadata(item, "HintPath");
             if (hint != null && File.Exists(Resolve(spec.Root, Expand(hint, spec.Properties))))
-                paths.Add(Resolve(spec.Root, Expand(hint, spec.Properties)));
+            {
+                var file = Resolve(spec.Root, Expand(hint, spec.Properties));
+                var properties = ReferenceProperties(item, spec.Properties);
+                if (hints.TryGetValue(file, out var existing)) properties = MergeReferenceProperties(existing, properties, spec.Path);
+                hints[file] = properties;
+            }
             else Warn(spec.Path, "assembly-reference", $"Unresolved assembly reference: {(string?)item.Attribute("Include")}");
         }
         var assetsPath = Resolve(spec.Root, spec.Properties.GetValueOrDefault("ProjectAssetsFile",
@@ -268,7 +314,32 @@ internal sealed class DirectProjectLoader(ScanReport report)
         }
         else if (spec.Items.Any(item => item.Name.LocalName == "PackageReference"))
             Warn(spec.Path, "package-assets", "Restored package assets are absent; package API bindings may be unavailable. Restore separately to improve coverage.");
-        return paths.Select(path => (MetadataReference)MetadataReference.CreateFromFile(path)).ToList();
+        return paths.Concat(hints.Keys).Distinct(ProjectLoader.PathComparer).Select(path =>
+        {
+            var properties = hints.GetValueOrDefault(path, MetadataReferenceProperties.Assembly);
+            if (hints.ContainsKey(path) && paths.Contains(path))
+                properties = MergeReferenceProperties(properties, MetadataReferenceProperties.Assembly, spec.Path);
+            return (MetadataReference)MetadataReference.CreateFromFile(path, properties);
+        }).ToList();
+    }
+
+    private static string? ItemMetadata(XElement item, string name) => (string?)item.Attribute(name) ??
+        item.Elements().FirstOrDefault(element => element.Name.LocalName == name)?.Value;
+
+    private static MetadataReferenceProperties ReferenceProperties(XElement item, Dictionary<string, string> properties)
+    {
+        var aliases = Expand(ItemMetadata(item, "Aliases") ?? "", properties)
+            .Split([',', ';'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.Ordinal).ToImmutableArray();
+        return new(MetadataImageKind.Assembly, aliases, IsTrue(Expand(ItemMetadata(item, "EmbedInteropTypes") ?? "false", properties)));
+    }
+
+    private MetadataReferenceProperties MergeReferenceProperties(MetadataReferenceProperties left, MetadataReferenceProperties right, string project)
+    {
+        if (left.EmbedInteropTypes != right.EmbedInteropTypes)
+            Warn(project, "reference-metadata", "Duplicate references disagree on EmbedInteropTypes; using the first reference's setting.");
+        var aliases = (left.Aliases.IsDefaultOrEmpty ? ["global"] : left.Aliases)
+            .Concat(right.Aliases.IsDefaultOrEmpty ? ["global"] : right.Aliases).Distinct(StringComparer.Ordinal).ToImmutableArray();
+        return left.WithAliases(aliases);
     }
 
     private void AddPack(string name, string framework, string project, HashSet<string> paths)

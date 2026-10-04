@@ -38,6 +38,7 @@ internal static class Program
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
             var report = new ScanReport();
+            var inventory = options.InputInventoryPath != null ? new CompilationInputInventory(target, options.ExperimentalDirect) : null;
             using var inputs = options.ExperimentalDirect
                 ? await new DirectProjectLoader(report).LoadAsync(target)
                 : await ProjectLoader.LoadProjectAwareAsync(target, report);
@@ -61,12 +62,14 @@ internal static class Program
                 }
                 if (compilation == null || !compilation.SyntaxTrees.Any())
                 {
+                    if (inventory != null && compilation != null) await inventory.CaptureAsync(project, compilation, project.AnalyzerOptions, inputs);
                     report.Warn("compilation-load", $"{project.Name}: no usable source compilation.");
                     report.SkippedProjects.Add(project.Name);
                     continue;
                 }
                 if (compilation.GetSpecialType(SpecialType.System_Object).TypeKind == TypeKind.Error)
                 {
+                    if (inventory != null) await inventory.CaptureAsync(project, compilation, project.AnalyzerOptions, inputs);
                     report.Warn("compilation-load", $"{project.Name}: core framework symbols are unavailable; no usable semantic analysis.");
                     report.SkippedProjects.Add(project.Name);
                     continue;
@@ -95,6 +98,7 @@ internal static class Program
                     }
                 }
                 var analyzerOptions = new AnalyzerOptions(additionalFiles, configOptions);
+                if (inventory != null) await inventory.CaptureAsync(project, compilation, analyzerOptions, inputs);
                 try
                 {
                     var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
@@ -147,6 +151,7 @@ internal static class Program
             if (options.SarifPath != null)
                 await SarifWriter.WriteAsync(options.SarifPath, target, findings, report,
                     options.ExperimentalDirect ? "direct" : "project");
+            if (inventory != null) await inventory.WriteAsync(options.InputInventoryPath!, report);
             if (report.HasFailures) return 2;
             return options.Fail && findings.Length > 0 ? 1 : 0;
         }
@@ -168,6 +173,7 @@ internal static class Program
         "  --config <path>            Override dotnetarium.json (version 2.0)\n" +
         "  --fail                     Return 1 when findings are present\n" +
         "  --experimental-direct      Reconstruct Roslyn inputs without MSBuild targets\n" +
+        "  --experimental-inputs <path> Write compilation input inventory as JSON\n" +
         "  -h, --help                 Show this help");
 
     private sealed class FileAdditionalText(string path) : AdditionalText
@@ -183,11 +189,11 @@ internal static class Program
         string.Equals(Path.GetFileName(path), "dotnetarium.json", StringComparison.OrdinalIgnoreCase);
 
     private sealed record Options(string Target, string? SarifPath, string? ConfigPath,
-        bool Fail, bool ExperimentalDirect)
+        bool Fail, bool ExperimentalDirect, string? InputInventoryPath)
     {
         internal static Options Parse(string[] args)
         {
-            string? target = null, sarif = null, config = null;
+            string? target = null, sarif = null, config = null, inventory = null;
             bool fail = false, experimentalDirect = false;
             for (int index = 0; index < args.Length; index++)
             {
@@ -200,6 +206,7 @@ internal static class Program
                     case "--config": config = NextValue(); break;
                     case "--fail": fail = true; break;
                     case "--experimental-direct": experimentalDirect = true; break;
+                    case "--experimental-inputs": inventory = NextValue(); break;
                     default:
                         if (arg.StartsWith("-", StringComparison.Ordinal))
                             throw new ArgumentException($"Unknown option {arg}.");
@@ -211,7 +218,7 @@ internal static class Program
             }
             if (target == null) throw new ArgumentException("A project or solution path is required.");
             if (config != null && !File.Exists(config)) throw new ArgumentException($"Configuration not found: {config}");
-            return new Options(target, sarif, config, fail, experimentalDirect);
+            return new Options(target, sarif, config, fail, experimentalDirect, inventory);
         }
     }
 }
