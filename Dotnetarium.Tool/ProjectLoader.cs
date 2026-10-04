@@ -13,6 +13,7 @@ internal sealed class ScanInputs(Workspace workspace, string? msbuildPath = null
     internal Dictionary<ProjectId, string> TestProjectMetadata { get; } = [];
     internal Dictionary<ProjectId, Dictionary<string, string>> InputProperties { get; } = [];
     internal Dictionary<ProjectId, RestoredAssetsState> RestoredAssets { get; } = [];
+    internal Dictionary<ProjectId, RestoredPackageInventory> PackageInventories { get; } = [];
     internal IEnumerable<Project> Projects => Workspace.CurrentSolution.Projects
         .Where(project => project.Language == LanguageNames.CSharp);
     public void Dispose() => Workspace.Dispose();

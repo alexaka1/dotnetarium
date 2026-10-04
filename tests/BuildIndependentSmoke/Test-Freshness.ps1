@@ -74,8 +74,7 @@ if ($packageAlias.inputInventory.projects[0].restoredAssets.status -ne 'matched'
     (HasNotice $packageAlias 'compiler-error') -or
     ($packageAlias.inputInventory.projects[0].references | Where-Object identity -like 'Google.Protobuf,*').aliases -notcontains 'proto') { throw 'Restored package aliases did not bind.' }
 
-# A parent may contain old transitive package assets even when its own direct
-# requests match. Until that graph is proven, keep it explicitly unverified.
+# Check the parent's actual exported edges as well as each child's request.
 $parentRoot = Join-Path $scratch 'package-parent'
 New-Item -ItemType Directory -Path $parentRoot | Out-Null
 $parentProject = Join-Path $parentRoot 'Parent.csproj'
@@ -86,10 +85,67 @@ Copy-Item -LiteralPath (Join-Path $projectRoot 'Inputs.cs') -Destination $parent
 if ($LASTEXITCODE -ne 0) { throw 'Package-bearing source dependency restore failed.' }
 $parentReport = Scan $parentProject $true
 $parentInput = @($parentReport.inputInventory.projects | Where-Object path -eq 'Parent.csproj')[0]
-if ($parentInput.restoredAssets.status -ne 'unverified' -or
-    -not (HasNotice $parentReport 'package-assets-unverified') -or
+if ($parentInput.restoredAssets.status -ne 'matched' -or
+    @($parentInput.references | Where-Object identity -like 'Google.Protobuf,*').Count -ne 1 -or
+    @($parentReport.runs[0].results).Count -ne 6) { throw 'Fresh source dependency graph did not preserve transitive bindings.' }
+
+# A successful child restore does not refresh the parent's assets. Simulate a
+# failed parent restore updating its dgspec but leaving old resolved edges.
+$aliasedXml = Get-Content -LiteralPath $assetsProject -Raw
+$aliasedXml.Replace('Version="' + $protobufVersion + '"', 'Version="[' + $protobufVersion + ']"') |
+    Set-Content -LiteralPath $assetsProject
+& dotnet restore $assetsProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Changed child fixture restore failed.' }
+$dgPath = Join-Path $parentRoot 'obj/Parent.csproj.nuget.dgspec.json'
+$dg = Get-Content -LiteralPath $dgPath -Raw | ConvertFrom-Json
+$childAssets = Get-Content -LiteralPath $assetsPath -Raw | ConvertFrom-Json
+$dg.projects.$assetsProject = $childAssets.project
+$dg | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $dgPath
+$staleParent = Scan $parentProject $true
+$parentInput = @($staleParent.inputInventory.projects | Where-Object path -eq 'Parent.csproj')[0]
+if ($parentInput.restoredAssets.status -ne 'stale' -or
     @($parentInput.references | Where-Object identity -like 'Google.Protobuf,*').Count -ne 0 -or
-    @($parentReport.runs[0].results).Count -ne 6) { throw 'Transitive restore uncertainty was hidden or independent findings were lost.' }
+    @($staleParent.runs[0].results).Count -ne 6) { throw 'A refreshed child restore/dgspec hid stale parent package edges.' }
+& dotnet restore $parentProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Refreshed parent fixture restore failed.' }
+$refreshedParent = Scan $parentProject $true
+if (@($refreshedParent.inputInventory.projects | Where-Object path -eq 'Parent.csproj')[0].restoredAssets.status -ne 'matched') {
+    throw 'Refreshed parent graph remained rejected.'
+}
+
+# PrivateAssets=all must not invent an exported package edge or a parent binding.
+$aliasedXml.Replace('Version="' + $protobufVersion + '"', 'Version="' + $protobufVersion + '" PrivateAssets="all"') |
+    Set-Content -LiteralPath $assetsProject
+& dotnet restore $parentProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Private-assets graph fixture restore failed.' }
+$privateParent = Scan $parentProject $true
+$parentInput = @($privateParent.inputInventory.projects | Where-Object path -eq 'Parent.csproj')[0]
+if ($parentInput.restoredAssets.status -ne 'matched' -or
+    @($parentInput.references | Where-Object identity -like 'Google.Protobuf,*').Count -ne 0) { throw 'Private dependency leaked into parent bindings.' }
+
+# Recursive validation must reach the leaf, not stop at the direct child.
+$topRoot = Join-Path $scratch 'package-top'
+New-Item -ItemType Directory -Path $topRoot | Out-Null
+$topProject = Join-Path $topRoot 'Top.csproj'
+$original.Replace('</Project>', '<ItemGroup><ProjectReference Include="../package-parent/Parent.csproj" /></ItemGroup></Project>') |
+    Set-Content -LiteralPath $topProject
+Copy-Item -LiteralPath (Join-Path $projectRoot 'Inputs.cs') -Destination $topRoot
+& dotnet restore $topProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Recursive source graph fixture restore failed.' }
+$topReport = Scan $topProject $true
+if (@($topReport.inputInventory.projects | Where-Object { $_.restoredAssets.status -ne 'matched' }).Count -ne 0 -or
+    @($topReport.runs[0].results).Count -ne 9) { throw 'Fresh recursive source graph was rejected.' }
+$leafXml = Get-Content -LiteralPath $assetsProject -Raw
+$leafXml.Replace('</PropertyGroup>', '<Version>2.0.0</Version></PropertyGroup>') | Set-Content -LiteralPath $assetsProject
+& dotnet restore $assetsProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Leaf identity fixture restore failed.' }
+$changedLeaf = Scan $topProject $true
+if (@($changedLeaf.inputInventory.projects | Where-Object path -eq 'Top.csproj')[0].restoredAssets.status -ne 'stale') {
+    throw 'Changed recursive source package identity did not invalidate ancestor assets.'
+}
+$leafXml | Set-Content -LiteralPath $assetsProject
+& dotnet restore $topProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Recursive source graph fixture reset failed.' }
 
 # A custom output directory is excluded from default globs. Explicit compile
 # selection can reuse its code, with an honest freshness/provenance notice.

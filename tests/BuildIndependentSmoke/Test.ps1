@@ -413,6 +413,7 @@ if (@($generatorAware.inputInventory.projects[0].sources | Where-Object origin -
     (HasNotice $generatorAware 'compiler-error') -or -not (HasNotice $generatorDirect 'compiler-error')) { throw 'Source-generator input gap was not measured accurately.' }
 
 . (Join-Path $PSScriptRoot 'Test-Freshness.ps1')
+. (Join-Path $PSScriptRoot 'Test-Packages.ps1')
 . (Join-Path $PSScriptRoot 'Test-GeneratedReuse.ps1')
 
 "Build-independent CLI checks passed. Reports and logs: $scratch" | Write-Output

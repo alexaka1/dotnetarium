@@ -21,7 +21,7 @@ internal static class RestoredAssetsValidator
             return Unknown("Restore request metadata is absent or does not describe this target framework.");
         if (!ProjectLoader.PathComparer.Equals(Path.GetFullPath(restoredPath.GetString()!), projectPath))
             return Stale("The assets file belongs to another project path.");
-        if (incomplete) return Unknown("Unsupported project inputs or package-bearing source project dependencies prevent full restore-graph validation.");
+        if (incomplete) return Unknown("Unsupported project inputs prevent full restore-request validation.");
         var restoredPackages = settings.TryGetProperty("dependencies", out var dependencies)
             ? dependencies.EnumerateObject().ToDictionary(item => item.Name, item => item.Value, StringComparer.OrdinalIgnoreCase)
             : new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
@@ -51,6 +51,26 @@ internal static class RestoredAssetsValidator
             ? references.EnumerateObject().Select(item => Path.GetFullPath(item.Name)).ToHashSet(ProjectLoader.PathComparer)
             : new HashSet<string>(ProjectLoader.PathComparer);
         if (!actualReferences.SetEquals(projectReferences)) return Stale("The source project-reference graph changed after restore.");
+        return new(assetsPath, "matched");
+    }
+
+    internal static bool DefaultPrivateAssets(string value) => AssetFlags(value, "ContentFiles,Analyzers,Build") ==
+        AssetFlags("ContentFiles,Analyzers,Build", "ContentFiles,Analyzers,Build");
+
+    internal static bool SameRange(string left, string right) => NormalizeRange(left) is { } normalized &&
+        normalized.Equals(NormalizeRange(right), StringComparison.OrdinalIgnoreCase);
+
+    internal static RestoredAssetsState ValidateExportedEdges(string assetsPath, JsonElement edge,
+        IReadOnlyDictionary<string, string> expected, string project)
+    {
+        var actual = edge.TryGetProperty("dependencies", out var dependencies)
+            ? dependencies.EnumerateObject().ToDictionary(item => item.Name, item => item.Value.GetString()!, StringComparer.OrdinalIgnoreCase)
+            : new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var dependency in expected)
+            if (!actual.TryGetValue(dependency.Key, out var range) || !SameRange(dependency.Value, range))
+                return new(assetsPath, "stale", $"The parent assets contain a different exported dependency request for {project}: {dependency.Key}.");
+        if (actual.Keys.Any(id => !expected.ContainsKey(id)))
+            return new(assetsPath, "unverified", $"The parent assets contain unevaluated exported dependencies for {project}.");
         return new(assetsPath, "matched");
     }
 

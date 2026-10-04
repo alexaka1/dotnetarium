@@ -40,7 +40,7 @@ internal static class Program
             var report = new ScanReport();
             var inventory = options.InputInventoryPath != null ? new CompilationInputInventory(target, options.ExperimentalDirect) : null;
             using var inputs = options.ExperimentalDirect
-                ? await new DirectProjectLoader(report).LoadAsync(target)
+                ? await new DirectProjectLoader(report, inventory != null).LoadAsync(target)
                 : await ProjectLoader.LoadProjectAwareAsync(target, report);
 
             var analyzerTypes = typeof(DnaRuleCatalog).Assembly.GetTypes()
@@ -151,7 +151,7 @@ internal static class Program
             if (options.SarifPath != null)
                 await SarifWriter.WriteAsync(options.SarifPath, target, findings, report,
                     options.ExperimentalDirect ? "direct" : "project");
-            if (inventory != null) await inventory.WriteAsync(options.InputInventoryPath!, report);
+            if (inventory != null) await inventory.WriteAsync(options.InputInventoryPath!, report, inputs);
             if (report.HasFailures) return 2;
             return options.Fail && findings.Length > 0 ? 1 : 0;
         }

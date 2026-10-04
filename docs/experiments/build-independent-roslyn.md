@@ -210,11 +210,28 @@ version spellings and an old assets timestamp remain usable. Changed versions,
 added/removed packages, changed aliases/asset selection, different project paths
 and changed source references produce `package-assets-stale` notifications.
 
-Unresolved/central versions, floating requests, unsupported package item
-operations/imports/conditions, missing restore metadata and package-bearing
-source dependency graphs are `unverified`. A parent can have stale transitive
-bindings even when its direct requests match. This slice does not prove that
-transitive graph; framework-only DTO references remain supported.
+The next slice adds conventional central versions from the nearest
+`Directory.Packages.props`, simple per-TFM conditions and `VersionOverride`.
+An override disabled by `CentralPackageVersionOverrideEnabled=false` is not
+accepted. Nested central files shadow their parent; custom imports are still
+reported. [Central package management](https://learn.microsoft.com/en-us/nuget/consume-packages/central-package-management).
+
+Package-bearing source dependencies are validated recursively. Each child's
+saved request must match its current supported inputs. Its exported package and
+source-project dependency requests, project identity/version and chosen framework
+must also match the edges inside the parent's actual `project.assets.json`.
+Refreshing a child restore or the parent's dgspec alone cannot establish this.
+The fixture verifies changed child constraints with refreshed child metadata and
+dgspec but old parent assets, plus changed leaf identity in a three-project graph.
+Ordinary asset propagation and `PrivateAssets=all` are supported. A source project
+can still be analyzed independently when its parent's cached bindings are rejected.
+
+Floating/unresolved versions, unsupported item operations/imports/conditions,
+central transitive pinning/global references, unsupported child asset propagation,
+framework package pruning in a package-bearing child and missing/error restore
+metadata remain `unverified`. These limits are explicit rather than a replacement
+NuGet resolver. Matching validates supported restore requests, not freshness of
+feeds or every SDK-generated restore property.
 
 Stale/unverified cached package bindings are omitted. Framework packs, explicit
 assembly references and available source project compilations still feed the
@@ -262,7 +279,10 @@ Verified with the unchanged engine and analyzer dependencies:
 | Fresh protobuf package and restored package alias | Real assembly binds; baseline findings/flows retained |
 | Equivalent minimum requests and old assets timestamp | Metadata remains matched; bindings preserved |
 | Changed version constraint, version, package set, alias, asset metadata or reference paths | Cached package bindings omitted; independent findings retained; partial SARIF |
-| Floating/missing version or package-bearing source dependency | Unverified restore graph is visible; independent findings retained |
+| Floating/missing version or unsupported graph arrangement | Unverified restore graph is visible; independent findings retained |
+| Conventional central versions, TFM conditions and overrides | Real protobuf bindings preserved; changed requests rejected per TFM |
+| Package-bearing source dependencies and three-project graph | Fresh edges accepted; changed exported requests/leaf identity rejected even after child restore |
+| Private source dependency package | Child package retained locally; no package binding invented in parent |
 | Custom intermediate directory | Unselected C# excluded; explicit selection adds its real command finding and reuse notice |
 | Real protoc-generated service, before/after explicit C# selection | 3 / 4 findings; the missing request-to-command finding returns with the same witness as project-aware loading |
 | Protobuf reuse with a failing custom build target | Same 4 findings; target marker was not written |
@@ -273,6 +293,75 @@ Generation in these positive fixtures is a separate controlled test-setup build.
 The direct scanner's build-independent behavior is checked after that setup.
 Automatic generators, restore execution and automatic fallback remain separate
 decisions. This work changes no analyzer rule, engine algorithm or package version.
+
+## SCA information available before compilation
+
+SCA can use restored dependency metadata independently of C# compilation. The
+experimental inventory now adds top-level `restoreInputs`, including when there
+is no usable source compilation. Each entry carries the project/TFM, assets path,
+validation status/reason, and a package snapshot. This addition currently applies
+to direct loading; project-aware inventories do not yet export a package graph.
+
+| Evidence at this step | Useful SCA check | Limits |
+| --- | --- | --- |
+| Resolved package ID/version per saved TFM/RID target | Match exact versions against known vulnerable ranges | `stale`/`unverified` means a saved graph, not a proven current dependency set |
+| Root dependency IDs and package/source-project edges with requested/resolved versions | Explain direct/transitive inclusion paths and which direct dependency to update | Constraints are not resolved versions; absent edge targets remain null rather than guessed |
+| Runtime/native/build/content/analyzer assets, including packages without compile DLLs | Include build-time and runtime-only exposure in SCA | Asset categories describe potential use, not deployment or vulnerable API reachability |
+| Saved NU1901–NU1904 code, package ID, severity, target graphs and advisory links | Retain evidence of a previous NuGet audit finding | Historical observations only; changed or suppressed advisories may be absent |
+| Saved audit enabled/mode/minimum severity; NU1900/NU1905 diagnostics | Explain limited or failed saved audit coverage | No diagnostics does not prove that an audit ran or that the database was current; suppression details are not exported yet |
+| Recorded package SHA-512 | Identify the restored artifact for an eventual SBOM/integrity comparison | Recorded metadata is not an independent hash check, signature verification or publisher attestation |
+| Declared package requests without assets | Inventory declared dependencies as unresolved | No exact version or complete transitive graph; never label a range as the installed version |
+| `HintPath` DLLs and framework reference assemblies | Report unclassified dependency evidence | Assembly versions do not establish NuGet package versions; reference-pack versions do not prove a deployed runtime patch level |
+
+Only the resolved snapshot and saved audit evidence above are exported now.
+Declaration-only SCA, SBOM export, DLL provenance and runtime inventory are future
+work. Graph parsing runs only when the input inventory is requested. The scanner
+performs no new audit lookup: every entry says `advisoryCheck: not-performed`.
+Stale graphs remain inspectable with their status, while their package DLLs are
+omitted from analysis. Raw audit messages, NuGet configuration contents and feed
+URLs/credentials are not copied into the package snapshot.
+
+Measured on 2026-10-04: SharpSaster exposes 24 restored packages and retains the
+same 41 complete finding/flow results. A separate, unbuilt restore-only probe
+using Newtonsoft.Json 12.0.1 produced NU1903 for GHSA-5crp-9r3c-p9vr. Its saved
+assets provided the package/version, high severity, advisory URL and `net10.0`
+target; the experimental inventory retained those fields despite an empty C#
+project. This fixture package is not added to Dotnetarium's dependencies.
+
+### Recommended next SCA slice
+
+1. Consume NuGet's `VulnerabilityInfo` API against resolved package versions,
+   using official NuGet version/range semantics. Its bulk pages allow local
+   matching and include update metadata. Record source, fetched time and database
+   revision; support an explicit offline snapshot and visible fetch failures.
+   [NuGet advisory API](https://learn.microsoft.com/en-us/nuget/api/vulnerability-info).
+2. Keep SCA results separate from DNA taint findings. Report advisory, severity,
+   package/version, TFM/RID and inclusion path. Deduplicate identical advisories
+   across paths, preserving affected targets. A vulnerable dependency does not
+   by itself prove that an exploitable API is reachable.
+3. Require a validated graph for a current-project conclusion. Historical/stale
+   matches can be shown with explicit uncertainty; missing assets/database data
+   cannot produce a successful clean SCA result. Use a separate SCA coverage state
+   so compilation errors do not prevent a valid dependency audit.
+4. Add advisory suppression with rationale and optional expiry, then SBOM export.
+   Package deprecation/license checks require additional package metadata and a
+   policy; old versions, missing lock files or package names alone are not
+   vulnerability findings. Signatures/package hashes need actual verification.
+
+For a separate manual current advisory check with an existing restore:
+
+```sh
+dotnet package list --project path/to/App.csproj --no-restore --include-transitive --vulnerable --format json --output-version 1
+```
+
+Verified against the restore-only probe. This does not compile; the SDK command
+still reads project inputs and accesses advisory sources, so it is not used by
+the direct scanner. `.NET 10` otherwise allows automatic restore for package-list
+commands. [Package-list command](https://learn.microsoft.com/en-us/dotnet/core/tools/dotnet-package-list).
+NuGet auditing defaults to all dependencies for projects targeting .NET 10;
+lower targets may default to direct dependencies. Audit source failures and
+suppression policy must remain visible when reporting coverage.
+[NuGet audit configuration](https://learn.microsoft.com/en-us/nuget/concepts/auditing-packages).
 
 ## Known prototype limitations
 
@@ -286,9 +375,10 @@ decisions. This work changes no analyzer rule, engine algorithm or package versi
 - Package compile references come from existing `project.assets.json` and its
   package folders. No dependency version is guessed or silently downloaded.
   Reference packs can also be read from the local NuGet cache. Supported direct
-  restore requests are validated; unsupported requests and package-bearing source
-  dependency graphs omit cached bindings and report partial coverage. Broader
-  graph/central-package validation and build-time assets need further work.
+  restore requests, conventional central versions and bounded source dependency
+  graphs are validated; unsupported arrangements omit cached bindings and report
+  partial coverage. Full NuGet evaluation, complex asset propagation, central
+  pinning/global references and build-time assets need further work.
   Restored package aliases, explicit assembly/source project aliases and interop
   metadata are supported.
   Package build-time inputs are reported when present. Properties such as
@@ -313,9 +403,11 @@ decisions. This work changes no analyzer rule, engine algorithm or package versi
    references, included sources, generated inputs, effective compiler settings
    and available target-framework/configuration metadata. Measured settings and
    reference-metadata discrepancies are fixed and covered by CLI fixtures.
-2. **Bounded prototype complete:** validate conventional direct restore requests,
-   package aliases/asset metadata and source-reference paths. Keep unsupported and
-   transitive graph arrangements unverified; extend those validators separately.
+2. **Bounded prototype complete:** validate conventional direct/central restore
+   requests, overrides, aliases/asset metadata and recursive source dependency
+   edges. Keep unsupported restore arrangements unverified. Dependency inventory
+   and saved audit evidence are available for a separate SCA experiment; current
+   advisory matching is not implemented.
 3. **Reuse verified:** explicitly supplied generated C#, custom output selection,
    real Razor/gRPC positive and safe cases, mapped SARIF and target nonexecution.
    Evaluate controlled SDK generation separately, without arbitrary custom

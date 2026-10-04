@@ -12,7 +12,7 @@ namespace Dotnetarium.Tool;
 
 // Experimental input reconstruction. This deliberately does not evaluate
 // MSBuild tasks, execute targets, restore packages, or run source generators.
-internal sealed class DirectProjectLoader(ScanReport report)
+internal sealed class DirectProjectLoader(ScanReport report, bool collectPackageInventory = false)
 {
     private readonly Dictionary<string, List<ProjectSpec>> specs = new(ProjectLoader.PathComparer);
     private readonly HashSet<string> visited = new(ProjectLoader.PathComparer);
@@ -156,6 +156,8 @@ internal sealed class DirectProjectLoader(ScanReport report)
             var documents = new List<(string Path, XDocument Document)>();
             var props = FindNearest(root, "Directory.Build.props");
             if (props != null) documents.Add((props, XDocument.Load(props)));
+            var central = FindNearest(root, "Directory.Packages.props");
+            if (central != null) documents.Add((central, XDocument.Load(central)));
             documents.Add((path, project));
             var properties = BaseProperties(root);
             properties["MSBuildProjectName"] = Path.GetFileNameWithoutExtension(path);
@@ -277,37 +279,18 @@ internal sealed class DirectProjectLoader(ScanReport report)
             }
             else Warn(spec.Path, "assembly-reference", $"Unresolved assembly reference: {(string?)item.Attribute("Include")}");
         }
-        var assetsPath = Resolve(spec.Root, spec.Properties.GetValueOrDefault("ProjectAssetsFile",
-            Path.Combine(spec.Properties.GetValueOrDefault("BaseIntermediateOutputPath", "obj"), "project.assets.json")));
+        var assetsPath = AssetsPath(spec);
         if (File.Exists(assetsPath))
         {
             try
             {
                 using var assets = JsonDocument.Parse(File.ReadAllText(assetsPath));
-                var declaredPackages = new Dictionary<string, PackageInput>(StringComparer.OrdinalIgnoreCase);
-                var incomplete = report.Notices.Any(notice => notice.Message.StartsWith(spec.Path + ":", StringComparison.Ordinal) &&
-                    notice.Id is "import" or "condition" or "property");
-                // A root restore can contain outdated transitive packages from
-                // source dependencies even when its direct requests match.
-                // Until that graph is validated, do not treat it as fresh.
-                if (HasPackageProjectDependency(spec, new HashSet<string>(ProjectLoader.PathComparer)))
-                    incomplete = true;
-                foreach (var item in spec.Items.Where(item => item.Name.LocalName == "PackageReference"))
-                {
-                    var include = Expand((string?)item.Attribute("Include") ?? "", spec.Properties);
-                    if (include.Length == 0 || item.Attribute("Update") != null || item.Attribute("Remove") != null)
-                    {
-                        incomplete = true;
-                        continue;
-                    }
-                    string Metadata(string name, string fallback = "") => Expand(ItemMetadata(item, name) ?? fallback, spec.Properties);
-                    if (!declaredPackages.TryAdd(include, new(Metadata("Version"), Metadata("Aliases"), Metadata("IncludeAssets", "All"),
-                        Metadata("ExcludeAssets", "None"), ItemMetadata(item, "PrivateAssets") is { } privateAssets ? Expand(privateAssets, spec.Properties) : null)))
-                        incomplete = true;
-                }
+                var (declaredPackages, incomplete) = PackageInputs(spec);
                 var validation = RestoredAssetsValidator.Validate(assetsPath, assets.RootElement, spec.Path, spec.Framework,
                     declaredPackages, spec.References, incomplete);
+                if (validation.Status == "matched") validation = ValidateProjectGraph(spec, assetsPath, assets.RootElement);
                 inputs.RestoredAssets[spec.Id] = validation;
+                if (collectPackageInventory) inputs.PackageInventories[spec.Id] = RestoredPackageInventory.Read(assets.RootElement, spec.Framework, spec.Root);
                 if (validation.Status != "matched")
                     Warn(spec.Path, validation.Status == "stale" ? "package-assets-stale" : "package-assets-unverified",
                         $"{validation.Reason} Cached package bindings were omitted; restore separately or supply explicit references to improve coverage.");
@@ -341,11 +324,11 @@ internal sealed class DirectProjectLoader(ScanReport report)
                             else Warn(spec.Path, "package-reference", $"Missing cached assembly: {library.Name}/{asset.Name}");
                         }
                     }
-                    if (assets.RootElement.TryGetProperty("logs", out var logs))
-                        foreach (var log in logs.EnumerateArray().Where(log => log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
-                            Warn(spec.Path, "package-restore", log.GetProperty("message").GetString()!);
                 }
                 else if (validation.Status == "matched") Warn(spec.Path, "package-assets", $"No assets target for {spec.Framework}; restore separately to improve coverage.");
+                if (assets.RootElement.TryGetProperty("logs", out var logs))
+                    foreach (var log in logs.EnumerateArray().Where(log => log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
+                        Warn(spec.Path, "package-restore", log.GetProperty("message").GetString()!);
                 // Generators may alter any compilation. Their assembly paths are
                 // evidence of missing inputs, not permission to execute them.
                 if (assets.RootElement.GetProperty("libraries").EnumerateObject().Any(library =>
@@ -353,7 +336,7 @@ internal sealed class DirectProjectLoader(ScanReport report)
                         file.GetString()?.StartsWith("analyzers/", StringComparison.Ordinal) == true)))
                     Warn(spec.Path, "generation", "Dependency analyzer/generator assemblies are present but were not executed.");
             }
-            catch (Exception error) when (error is JsonException or KeyNotFoundException or InvalidOperationException or ArgumentException)
+            catch (Exception error) when (error is JsonException or KeyNotFoundException or InvalidOperationException or ArgumentException or IOException or UnauthorizedAccessException)
             {
                 inputs.RestoredAssets[spec.Id] = new(assetsPath, "invalid", error.Message);
                 Warn(spec.Path, "package-assets", $"Invalid assets metadata: {error.Message}");
@@ -379,20 +362,139 @@ internal sealed class DirectProjectLoader(ScanReport report)
     private static string? ItemMetadata(XElement item, string name) => (string?)item.Attribute(name) ??
         item.Elements().FirstOrDefault(element => element.Name.LocalName == name)?.Value;
 
-    private bool HasPackageProjectDependency(ProjectSpec spec, HashSet<string> seen)
+    private static string AssetsPath(ProjectSpec spec) => Resolve(spec.Root, spec.Properties.GetValueOrDefault("ProjectAssetsFile",
+        Path.Combine(spec.Properties.GetValueOrDefault("MSBuildProjectExtensionsPath",
+            spec.Properties.GetValueOrDefault("BaseIntermediateOutputPath", "obj")), "project.assets.json")));
+
+    private (Dictionary<string, PackageInput> Packages, bool Incomplete) PackageInputs(ProjectSpec spec)
     {
-        if (!seen.Add(spec.Path)) return false;
-        foreach (var path in spec.References)
+        var incomplete = report.Notices.Any(notice => notice.Message.StartsWith(spec.Path + ":", StringComparison.Ordinal) &&
+            notice.Id is "import" or "condition" or "property");
+        var central = IsTrue(spec.Properties.GetValueOrDefault("ManagePackageVersionsCentrally"));
+        // Pinning and global references alter the exported restore graph. They
+        // remain unverified until their full NuGet semantics are supported.
+        incomplete |= IsTrue(spec.Properties.GetValueOrDefault("CentralPackageTransitivePinningEnabled")) ||
+            spec.Items.Any(item => item.Name.LocalName == "GlobalPackageReference");
+        var versions = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "PackageVersion"))
         {
-            if (!specs.TryGetValue(path, out var candidates)) return true;
-            var dependency = candidates.FirstOrDefault(candidate => candidate.Framework == spec.Framework) ??
-                (spec.Framework == "net10.0" ? candidates.FirstOrDefault(candidate => candidate.Framework == "net8.0") : null);
-            if (dependency == null || dependency.Items.Any(item => item.Name.LocalName == "PackageReference") ||
-                report.Notices.Any(notice => notice.Message.StartsWith(dependency.Path + ":", StringComparison.Ordinal) && notice.Id is "import" or "condition" or "property") ||
-                HasPackageProjectDependency(dependency, seen)) return true;
+            var id = Expand((string?)item.Attribute("Include") ?? "", spec.Properties);
+            if (id.Length == 0 || item.Attribute("Update") != null || item.Attribute("Remove") != null ||
+                !versions.TryAdd(id, Expand(ItemMetadata(item, "Version") ?? "", spec.Properties)) ||
+                item.Elements().Any(element => element.Attribute("Condition") != null)) incomplete |= central;
         }
-        return false;
+        var packages = new Dictionary<string, PackageInput>(StringComparer.OrdinalIgnoreCase);
+        foreach (var item in spec.Items.Where(item => item.Name.LocalName == "PackageReference"))
+        {
+            var id = Expand((string?)item.Attribute("Include") ?? "", spec.Properties);
+            if (id.Length == 0 || item.Attribute("Update") != null || item.Attribute("Remove") != null)
+            {
+                incomplete = true;
+                continue;
+            }
+            string Metadata(string name, string fallback = "") => Expand(ItemMetadata(item, name) ?? fallback, spec.Properties);
+            var version = Metadata("Version");
+            var versionOverride = Metadata("VersionOverride");
+            if (central)
+            {
+                if (version.Length > 0 || (versionOverride.Length > 0 && IsFalse(spec.Properties.GetValueOrDefault("CentralPackageVersionOverrideEnabled"))))
+                    incomplete = true;
+                version = versionOverride.Length > 0 ? versionOverride : versions.GetValueOrDefault(id, "");
+            }
+            else if (versionOverride.Length > 0) incomplete = true;
+            if (item.Elements().Any(element => element.Attribute("Condition") != null)) incomplete = true;
+            if (!packages.TryAdd(id, new(version, Metadata("Aliases"), Metadata("IncludeAssets", "All"), Metadata("ExcludeAssets", "None"),
+                ItemMetadata(item, "PrivateAssets") is { } privateAssets ? Expand(privateAssets, spec.Properties) : null))) incomplete = true;
+        }
+        return (packages, incomplete);
     }
+
+    private RestoredAssetsState ValidateProjectGraph(ProjectSpec root, string assetsPath, JsonElement assets)
+    {
+        RestoredAssetsState Unknown(string reason) => new(assetsPath, "unverified", reason);
+        if (assets.TryGetProperty("logs", out var logs) && logs.EnumerateArray().Any(log =>
+            log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
+            return Unknown("The saved restore contains errors; its resolved graph cannot be accepted.");
+        if (root.References.Length == 0) return new(assetsPath, "matched");
+        if (!assets.TryGetProperty("targets", out var targets) || !targets.TryGetProperty(root.Framework, out var target) ||
+            !assets.TryGetProperty("libraries", out var libraries)) return Unknown("Resolved source project graph is absent.");
+        var pending = new Queue<ProjectSpec>();
+        pending.Enqueue(root);
+        var seen = new HashSet<ProjectId>();
+        while (pending.TryDequeue(out var parent))
+        {
+            if (!seen.Add(parent.Id)) continue;
+            foreach (var path in parent.References)
+            {
+                if (!specs.TryGetValue(path, out var candidates)) return Unknown($"Source dependency is unavailable: {path}");
+                var child = candidates.FirstOrDefault(candidate => candidate.Framework == parent.Framework) ??
+                    (parent.Framework == "net10.0" ? candidates.FirstOrDefault(candidate => candidate.Framework == "net8.0") : null);
+                if (child == null) return Unknown($"No compatible source dependency framework: {path}");
+                var (packages, incomplete) = PackageInputs(child);
+                var childAssetsPath = AssetsPath(child);
+                if (!File.Exists(childAssetsPath))
+                {
+                    if (packages.Count > 0 || child.References.Length > 0 || incomplete)
+                        return Unknown($"Source dependency restore metadata is absent: {path}");
+                }
+                else
+                {
+                    using var childAssets = JsonDocument.Parse(File.ReadAllText(childAssetsPath));
+                    var childState = RestoredAssetsValidator.Validate(childAssetsPath, childAssets.RootElement, child.Path, child.Framework,
+                        packages, child.References, incomplete);
+                    if (childState.Status != "matched") return new(assetsPath, childState.Status, $"Source dependency {path}: {childState.Reason}");
+                    if (childAssets.RootElement.TryGetProperty("logs", out var childLogs) && childLogs.EnumerateArray().Any(log =>
+                        log.TryGetProperty("level", out var level) && level.GetString() == "Error"))
+                        return Unknown($"Source dependency restore contains errors: {path}");
+                    if (childAssets.RootElement.GetProperty("project").GetProperty("frameworks").GetProperty(child.Framework)
+                        .TryGetProperty("packagesToPrune", out var pruning) && packages.Keys.Any(id => pruning.TryGetProperty(id, out _)))
+                        return Unknown($"Source dependency uses framework package pruning that requires further propagation validation: {path}");
+                }
+                var entries = libraries.EnumerateObject().Where(library =>
+                    library.Value.TryGetProperty("type", out var type) && type.GetString() == "project" &&
+                    library.Value.TryGetProperty("msbuildProject", out var projectPath) &&
+                    ProjectLoader.PathComparer.Equals(Resolve(root.Root, projectPath.GetString()!), child.Path)).ToArray();
+                if (entries.Length != 1 || !target.TryGetProperty(entries[0].Name, out var edge) ||
+                    !edge.TryGetProperty("framework", out var framework) || framework.GetString() != $".NETCoreApp,Version=v{child.Framework[3..]}")
+                    return Unknown($"Resolved source dependency identity/framework is unavailable or ambiguous: {path}");
+                // Compare edges inside the parent's actual assets, not a dgspec
+                // that a failed restore may have refreshed without updating them.
+                var exported = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var package in packages)
+                {
+                    if (package.Value.PrivateAssets?.Equals("all", StringComparison.OrdinalIgnoreCase) == true) continue;
+                    if (!package.Value.IncludeAssets.Equals("all", StringComparison.OrdinalIgnoreCase) ||
+                        !package.Value.ExcludeAssets.Equals("none", StringComparison.OrdinalIgnoreCase) ||
+                        (package.Value.PrivateAssets != null && !RestoredAssetsValidator.DefaultPrivateAssets(package.Value.PrivateAssets)))
+                        return Unknown($"Unsupported dependency asset propagation in {path}: {package.Key}");
+                    exported[package.Key] = package.Value.Version;
+                }
+                foreach (var reference in child.References)
+                {
+                    if (!specs.TryGetValue(reference, out var grandchildren) || grandchildren.Count == 0)
+                        return Unknown($"Source dependency is unavailable: {reference}");
+                    var grandchild = grandchildren.FirstOrDefault(candidate => candidate.Framework == child.Framework) ??
+                        (child.Framework == "net10.0" ? grandchildren.FirstOrDefault(candidate => candidate.Framework == "net8.0") : null);
+                    if (grandchild == null) return Unknown($"No compatible dependency: {reference}");
+                    exported[ProjectPackageId(grandchild)] = ProjectVersion(grandchild);
+                }
+                var edgeState = RestoredAssetsValidator.ValidateExportedEdges(assetsPath, edge, exported, path);
+                if (edgeState.Status != "matched") return edgeState;
+                if (!entries[0].Name[..entries[0].Name.LastIndexOf('/')].Equals(ProjectPackageId(child), StringComparison.OrdinalIgnoreCase) ||
+                    !RestoredAssetsValidator.SameRange("[" + entries[0].Name[(entries[0].Name.LastIndexOf('/') + 1)..] + "]", "[" + ProjectVersion(child) + "]"))
+                    return new(assetsPath, "stale", $"Source dependency version changed after restore: {path}");
+                pending.Enqueue(child);
+            }
+        }
+        return new(assetsPath, "matched");
+    }
+
+    private static string ProjectVersion(ProjectSpec spec) => spec.Properties.GetValueOrDefault("Version",
+        spec.Properties.GetValueOrDefault("VersionPrefix", "1.0.0") +
+        (spec.Properties.GetValueOrDefault("VersionSuffix", "") is { Length: > 0 } suffix ? "-" + suffix : ""));
+
+    private static string ProjectPackageId(ProjectSpec spec) => spec.Properties.GetValueOrDefault("PackageId",
+        spec.Properties.GetValueOrDefault("AssemblyName", Path.GetFileNameWithoutExtension(spec.Path)));
 
     private static MetadataReferenceProperties ReferenceProperties(XElement item, Dictionary<string, string> properties)
     {

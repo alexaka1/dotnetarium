@@ -115,7 +115,7 @@ internal sealed class CompilationInputInventory(string target, bool direct)
         });
     }
 
-    internal async Task WriteAsync(string path, ScanReport report)
+    internal async Task WriteAsync(string path, ScanReport report, ScanInputs inputs)
     {
         var fullPath = Path.GetFullPath(path);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
@@ -126,10 +126,20 @@ internal sealed class CompilationInputInventory(string target, bool direct)
             target = Relative(target),
             loadingMode = direct ? "direct" : "project",
             projects,
+            // Dependency evidence survives even if a project has no usable
+            // compilation. This snapshot does not perform an advisory lookup.
+            restoreInputs = inputs.RestoredAssets.Select(pair => new
+            {
+                project = Relative(inputs.Workspace.CurrentSolution.GetProject(pair.Key)?.FilePath ?? ""),
+                targetFramework = inputs.InputProperties.GetValueOrDefault(pair.Key)?.GetValueOrDefault("TargetFramework"),
+                assets = new { path = Relative(pair.Value.Path), status = pair.Value.Status, reason = pair.Value.Reason },
+                advisoryCheck = "not-performed",
+                packageInventory = inputs.PackageInventories.GetValueOrDefault(pair.Key)
+            }).OrderBy(input => input.project, StringComparer.Ordinal).ThenBy(input => input.targetFramework, StringComparer.Ordinal).ToArray(),
             analyzedProjects = report.AnalyzedProjects,
             skippedProjects = report.SkippedProjects,
             notices = report.Notices.Distinct().Select(notice => new { id = notice.Id, message = notice.Message, isFailure = notice.IsFailure })
-        }, new JsonSerializerOptions { WriteIndented = true });
+        }, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
     }
 
     private async Task<object[]> DocumentFilesAsync(IEnumerable<TextDocument> documents)
