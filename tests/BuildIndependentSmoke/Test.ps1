@@ -356,7 +356,8 @@ $settingsRoot = Join-Path $scratch 'settings'
 New-Item -ItemType Directory -Path $settingsRoot | Out-Null
 $settingsProject = Join-Path $settingsRoot 'Settings.csproj'
 $protobufAssembly = @($grpcDirect.inputInventory.projects[0].references | Where-Object { $_.identity -like 'Google.Protobuf,*' })[0].path
-$protobufAssembly = [IO.Path]::GetFullPath((Join-Path $grpcRoot $protobufAssembly))
+$protobufAssembly = [IO.Path]::GetFullPath([IO.Path]::Combine($grpcRoot, $protobufAssembly))
+if (-not (Test-Path -LiteralPath $protobufAssembly)) { throw "Inventory reference assembly is unavailable: $protobufAssembly" }
 $escapedAssembly = [System.Security.SecurityElement]::Escape($protobufAssembly)
 @"
 <Project Sdk="Microsoft.NET.Sdk">

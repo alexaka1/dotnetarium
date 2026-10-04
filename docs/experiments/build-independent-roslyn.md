@@ -84,6 +84,9 @@ Windows and Linux CI checks are enabled for this experimental branch. The first
 remote run passed Linux; Windows failed before scanning because the workflow had
 not built the tool DLL. The Windows workflow now builds it before the experiment,
 and both jobs retain inventories, SARIF and logs, including after failed checks.
+Those artifacts also identified a cross-drive path error in the aliased-reference
+fixture: Windows stores packages on `C:` and fixtures on `D:`. The fixture now
+preserves rooted reference paths when resolving the inventory back to a DLL.
 Remote CI results are separate from the local verification above.
 
 ## Compilation-input comparison
