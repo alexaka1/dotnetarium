@@ -41,6 +41,11 @@ Recursive taint analysis has a per-method work limit. A cutoff returns exit code
 
 ## Configure rules
 
+Taint analysis considers remote inputs by default. To also check console input,
+process arguments and environment values, set `"ThreatModels": ["remote", "local"]`
+in `dotnetarium.json`. See [input scope](docs/RuleConfiguration.md#input-scope)
+for coverage and custom source models.
+
 Built-in models cover common .NET and provider APIs. To add a source, sink, sanitizer, or transfer, place `dotnetarium.json` beside a project. The NuGet analyzer picks it up during builds, and the global tool finds it when scanning that project. For a solution scan, a file beside the solution applies to projects without their own config. Use `--config path/to/rules.json` to override automatic discovery for a scan.
 
 Use `.editorconfig` to change a diagnostic's severity:

@@ -253,6 +253,9 @@ $nugetConfig = Join-Path $scratch 'NuGet.Config'
   </packageSourceMapping>
 </configuration>
 "@ | Set-Content -LiteralPath $nugetConfig -Encoding utf8
+# These sink/flow witnesses intentionally use stdin, so opt into its local scope.
+'{"Version":"2.0","ThreatModels":["remote","local"]}' |
+    Set-Content -LiteralPath (Join-Path $projectPath 'dotnetarium.json') -Encoding utf8
 & dotnet restore $project --configfile $nugetConfig --nologo -v quiet
 if ($LASTEXITCODE -ne 0) { throw 'CLI fixture restore failed.' }
 $buildOutput = & dotnet build $project --no-restore --nologo -v quiet -p:UseSharedCompilation=false 2>&1
@@ -358,6 +361,7 @@ $config = Join-Path $scratch 'custom.json'
 @'
 {
   "Version": "2.0",
+  "ThreatModels": [ "remote", "local" ],
   "Sinks": [
     {
       "Type": "Custom",
@@ -378,7 +382,7 @@ if ($LASTEXITCODE -ne 0 -or ([regex]::Matches(($customOutput -join "`n"), 'DNA00
     throw 'CLI did not discover lowercase dotnetarium.json.'
 }
 $override = Join-Path $scratch 'override.json'
-'{"Version":"2.0","Sinks":[]}' | Set-Content -LiteralPath $override -Encoding utf8
+'{"Version":"2.0","ThreatModels":["remote","local"],"Sinks":[]}' | Set-Content -LiteralPath $override -Encoding utf8
 $overrideOutput = & $tool $project --config $override
 if ($LASTEXITCODE -ne 0 -or ([regex]::Matches(($overrideOutput -join "`n"), 'DNA0001')).Count -ne 2) {
     throw 'Explicit --config did not override the project config.'
@@ -463,7 +467,7 @@ public static class Demo {
     public static void Crypto() { using var aes = Aes.Create(); aes.Mode = CipherMode.ECB; }
 }
 '@ | Set-Content -LiteralPath (Join-Path $budgetRoot 'Demo.cs')
-'{"Version":"2.0","MaxTaintAnalysisWork":1000}' |
+'{"Version":"2.0","ThreatModels":["remote","local"],"MaxTaintAnalysisWork":1000}' |
     Set-Content -LiteralPath (Join-Path $budgetRoot 'dotnetarium.json')
 & dotnet restore $budgetProject --configfile $nugetConfig --nologo -v quiet
 if ($LASTEXITCODE -ne 0) { throw 'Budget fixture restore failed.' }
@@ -494,6 +498,8 @@ foreach ($failFlag in @($false, $true)) {
 $migrationRoot = Join-Path $scratch 'migration'
 New-Item -ItemType Directory -Path $migrationRoot | Out-Null
 $migrationProject = Join-Path $migrationRoot 'Migration.csproj'
+'{"Version":"2.0","ThreatModels":["remote","local"]}' |
+    Set-Content -LiteralPath (Join-Path $migrationRoot 'dotnetarium.json') -Encoding utf8
 @"
 <Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
 <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="10.0.12" />
@@ -551,5 +557,61 @@ if (@($migrationReport.runs[0].results).Count -ne 3 -or
     throw 'CLI migration fixture must retain two literal secrets and one ordinary command finding.'
 }
 
-'Analyzer NuGet package and global tool scan .NET 8/10; custom JSON, relative SARIF, and compiler error checks passed.' | Write-Output
+$scopeRoot = Join-Path $scratch 'scope'
+New-Item -ItemType Directory -Path $scopeRoot | Out-Null
+$scopeProject = Join-Path $scopeRoot 'Scope.csproj'
+@"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+  <ItemGroup><FrameworkReference Include="Microsoft.AspNetCore.App" /><PackageReference Include="Dotnetarium.Analyzers" Version="$analyzerVersion" /></ItemGroup>
+</Project>
+"@ | Set-Content -LiteralPath $scopeProject -Encoding utf8
+@'
+using System;
+using System.Diagnostics;
+using Microsoft.AspNetCore.Http;
+public class Origins {
+    public void Remote(HttpRequest request) => Process.Start(request.Query["command"].ToString());
+    public void Stdin() => Process.Start(Console.ReadLine());
+    public void EnvironmentInput() => Process.Start(Environment.GetEnvironmentVariable("COMMAND"));
+}
+'@ | Set-Content -LiteralPath (Join-Path $scopeRoot 'Origins.cs') -Encoding utf8
+& dotnet restore $scopeProject --configfile $nugetConfig --nologo -v quiet
+if ($LASTEXITCODE -ne 0) { throw 'Scope fixture restore failed.' }
+$scopeConfig = Join-Path $scopeRoot 'dotnetarium.json'
+foreach ($scope in @(
+    @{ Name = 'default'; Selection = $null; Count = 1 },
+    @{ Name = 'local'; Selection = @('local'); Count = 2 },
+    @{ Name = 'both'; Selection = @('remote', 'local'); Count = 3 }
+)) {
+    if ($null -eq $scope.Selection) {
+        if (Test-Path -LiteralPath $scopeConfig) { Remove-Item -LiteralPath $scopeConfig }
+    } else {
+        @{ Version = '2.0'; ThreatModels = $scope.Selection } | ConvertTo-Json |
+            Set-Content -LiteralPath $scopeConfig -Encoding utf8
+    }
+    $scopeBuild = & dotnet build $scopeProject --no-restore --nologo -v quiet -t:Rebuild -p:UseSharedCompilation=false 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($scopeBuild -match 'DNA9000|AD0001') -or
+        @($scopeBuild | Where-Object { $_ -match 'warning DNA0002' } | Sort-Object -Unique).Count -ne $scope.Count) {
+        $scopeBuild | Write-Output
+        throw "Packaged analyzer source selection failed: $($scope.Name)"
+    }
+    $scopeSarif = Join-Path $scopeRoot "$($scope.Name).sarif"
+    & $tool $scopeProject --sarif $scopeSarif --fail | Out-Null
+    if ($LASTEXITCODE -ne 1) { throw "CLI scope scan failed: $($scope.Name)" }
+    $scopeReport = Get-Content -LiteralPath $scopeSarif -Raw | ConvertFrom-Json
+    if (@($scopeReport.runs[0].results | Where-Object ruleId -eq 'DNA0002').Count -ne $scope.Count -or
+        $scopeReport.runs[0].invocations[0].properties.'dotnetarium.coverage' -ne 'complete') {
+        throw "CLI and analyzer source selections disagree: $($scope.Name)"
+    }
+}
+$scopeOverride = Join-Path $scopeRoot 'remote.json'
+'{"Version":"2.0","ThreatModels":["remote"]}' | Set-Content -LiteralPath $scopeOverride -Encoding utf8
+$scopeOverrideSarif = Join-Path $scopeRoot 'override.sarif'
+& $tool $scopeProject --config $scopeOverride --sarif $scopeOverrideSarif --fail | Out-Null
+if ($LASTEXITCODE -ne 1 -or @((Get-Content -LiteralPath $scopeOverrideSarif -Raw | ConvertFrom-Json).runs[0].results).Count -ne 1) {
+    throw 'Explicit CLI configuration did not replace project source selection.'
+}
+
+'Analyzer NuGet package and global tool scan .NET 8/10; source selection, custom JSON, relative SARIF, and compiler error checks passed.' | Write-Output
 exit 0
