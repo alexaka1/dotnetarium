@@ -30,6 +30,39 @@ public sealed class InterproceduralReuseTests
                 }
             }
             """;
+        var value = AnalyzeReturnedValue(source);
+        Assert.Contains(value.Locations, location => location.LocationType?.Name == "First");
+        Assert.Contains(value.Locations, location => location.LocationType?.Name == "Second");
+    }
+
+    [Fact]
+    public void Loop_call_recomputes_when_only_the_receivers_heap_state_changes()
+    {
+        var value = AnalyzeReturnedValue("""
+            public sealed class First {}
+            public sealed class Second {}
+            public sealed class Box {
+                public object Value;
+                public object Read() => Value;
+            }
+            public static class Demo {
+                public static object Run(bool again) {
+                    var box = new Box { Value = new First() };
+                    object result;
+                    do {
+                        result = box.Read();
+                        box.Value = new Second();
+                    } while (again);
+                    return result;
+                }
+            }
+            """);
+        Assert.Contains(value.Locations, location => location.LocationType?.Name == "First");
+        Assert.Contains(value.Locations, location => location.LocationType?.Name == "Second");
+    }
+
+    private static PointsToAbstractValue AnalyzeReturnedValue(string source)
+    {
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
             .Select(path => MetadataReference.CreateFromFile(path));
         var compilation = CSharpCompilation.Create("Loop", [CSharpSyntaxTree.ParseText(source)], references,
@@ -43,9 +76,7 @@ public sealed class InterproceduralReuseTests
             InterproceduralAnalysisKind.ContextSensitive, CancellationToken.None, 5, 5);
         var result = PointsToAnalysis.TryGetOrComputeResult(graph, method, options, WellKnownTypeProvider.GetOrCreate(compilation),
             PointsToAnalysisKind.Complete, config, null);
-        var value = Assert.IsType<PointsToAbstractValue>(result!.ReturnValueAndPredicateKind!.Value.Value);
-        Assert.Contains(value.Locations, location => location.LocationType?.Name == "First");
-        Assert.Contains(value.Locations, location => location.LocationType?.Name == "Second");
+        return Assert.IsType<PointsToAbstractValue>(result!.ReturnValueAndPredicateKind!.Value.Value);
     }
 
     [Theory]

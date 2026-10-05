@@ -2457,8 +2457,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                     getInterproceduralControlFlowGraph: GetInterproceduralControlFlowGraph,
                     getAnalysisEntityForFlowCapture: GetAnalysisEntityForFlowCapture,
                     getInterproceduralCallStackForOwningSymbol: GetInterproceduralCallStackForOwningSymbol,
-                    cachedCallerValues: ReuseCompletedInvocations && newMethodsBeingAnalyzed.Any(context =>
-                        SymbolEqualityComparer.Default.Equals(context.OwningSymbol.OriginalDefinition, invokedMethod))
+                    cachedCallerValues: ReuseCompletedInvocations
                         ? new Dictionary<IOperation, TAbstractAnalysisValue>() : null);
 
                 // Local functions.

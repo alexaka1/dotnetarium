@@ -700,6 +700,54 @@ recursive origins, helper/getter/constructor/interface sources, captured callbac
 metadata method groups, generic return inference, unavailable/native body models
 and proof-budget fallback. SharpSaster preserves all 41 complete findings and flows.
 
+### Isolated LANCommander command-injection profile
+
+The full LANCommander run was stopped at the user's request, without a completed
+SARIF report. Its process had reached approximately 4.24 GiB peak working set.
+Subsequent profiling targets only `CommandInjectionTaintAnalyzer` on
+`LANCommander.SDK.Services.GameClient.InstallAsync`, with analyzer concurrency
+disabled and the existing method/local-function depth of five preserved.
+
+| Single-rule case | Analyzer wall time | Points-to executions | Points-to block visits | Taint executions |
+| --- | ---: | ---: | ---: | ---: |
+| Origin eligibility fix | 92.44 s | 106,893 | 1,425,016 | 84,472 |
+| Completed ordinary-call reuse | 82.77 s | 78,457 | 1,042,999 | 84,472 |
+| Same reuse plus actual cmdlet generation | 83.05 s | Not separately compared | Not separately compared | Not separately compared |
+
+These are instrumented measurements of one root method and its nested callbacks,
+not full-application timings or counts of distinct methods. The call graph cycles
+through game/add-on installation and repeatedly expands scripting, download and
+retry helpers. Both prerequisite points-to analysis and taint analysis contribute;
+this is a branching context-sensitive expansion rather than an infinite loop.
+
+Completed points-to summaries now also cover ordinary calls at the same call site
+when receiver, arguments, complete input state, captures, caller dependencies and
+dependent analysis results match. The cache remains visitor-scoped and capped at
+32 entries. The measured reduction in points-to executions is approximately 27%;
+wall time improves approximately 10%. Taint summaries are not reused by this
+change, and the timeout is **not resolved**. The measured prototype process peaked
+at approximately 1.05 GiB working set. Snapshotting and retaining bounded summaries
+adds memory/comparison work and does not prevent expansion when inputs change.
+
+The SDK input initially has four compiler errors. One is the unresolved generated
+`InitialSessionState.AddCustomCmdlets()` extension, which forces origin eligibility
+to retain normal analysis. Running LANCommander's actual cmdlet generator in the
+external diagnostic harness adds one source file, produces no generator errors and
+reduces compiler errors to two. The installer still reaches a modeled origin and
+remains expensive. This is a diagnostic comparison, not an implementation of
+automatic source-generator execution in the loader.
+
+The reuse change passes the existing 683-test suite and all seven focused reuse
+tests, including a new case where the same receiver and argument list are retained
+while its heap state changes. SharpSaster retains all 41 complete findings and
+flows. Origin-eligibility CI passes on Windows and Linux.
+
+Further work should use this single-method fixture to evaluate recursive component
+summaries and widening, including return values, heap/ref/capture effects and flow
+provenance. Blindly skipping recursive methods or removing the `System.Object`
+entry-point container would lose valid coverage. An eventual resource budget must
+report incomplete analysis explicitly; an interrupted run is not a clean scan.
+
 ## Next experiment and promotion gates
 
 1. **Complete:** compilation-input inventory and comparison, including resolved

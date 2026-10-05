@@ -12,7 +12,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
         where TAnalysisContext : AbstractDataFlowAnalysisContext<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue>
         where TAnalysisResult : class, IDataFlowAnalysisResult<TAbstractAnalysisValue>
     {
-        // One completed recursive-call summary per call site, scoped to this visitor and bounded.
+        // One completed-call summary per call site, scoped to this visitor and bounded.
         // Recursive active calls are never memoized. This is not a method-global
         // cache: caller state, aliases, captures and call depth remain significant.
         private const int CompletedInvocationLimit = 32;
