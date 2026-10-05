@@ -127,8 +127,8 @@ not add a PowerShell execution sink or claim to resolve debugger access control.
 ### Verification (2026-10-05)
 
 Steps 1–6 are complete on `fix/main-scan-performance` and
-`experiment/build-independent-roslyn`. Both branches use the same configuration
-schema, model compiler and built-in source scopes.
+`experiment/build-independent-roslyn`. Both branches share the configuration
+schema, source-selection logic and built-in source scopes.
 
 - Both branches pass 749 unit tests, including 45 scope-policy cases. These cover
   actual defaults, local-only/combined selection, stdin aliases and async reads,
