@@ -108,11 +108,16 @@ When the limit is reached, analysis stops for that root and other methods and
 rules continue. The analyzer package emits **DNA9000**, identifying the rule,
 method and work counters. This is a coverage notice, not a security finding.
 The global tool writes an `analysis-budget` SARIF execution notification and
-marks the scan **partial**, and returns exit code **2**, including with `--fail`.
+marks the scan **partial**. Default loading returns exit code **2**, including
+with `--fail`. Experimental `-nb` / `--no-build` loading treats taint cutoffs as
+nonfatal: it returns **0**, or **1** when `--fail` is set and security findings
+are present, unless a separate fatal error occurs.
 The coverage notice is excluded from security findings and rule definitions.
 Other findings are retained in SARIF; zero findings in a partial scan is not a
-clean result. Compiler and workspace failures also return 2 and retain partial
-SARIF when requested.
+clean result. Default-mode compiler and workspace failures also return 2 and
+retain partial SARIF when requested. No-build mode continues through compiler
+errors in usable compilations; invalid inputs and analyzer failures remain
+fatal. See [scan modes](scan-modes.md) for the full exit-code policy.
 
 To retry with a larger budget, set a positive integer in `dotnetarium.json`:
 
@@ -143,6 +148,6 @@ Accepted ASP.NET Core WebSockets are request sources. `ReceiveAsync` transfers t
 
 Public `[Microsoft.Azure.Functions.Worker.Function]` methods are recognized as entry points. Parameters carrying the isolated worker's `[HttpTrigger]` or `[ServiceBusTrigger]` are sources, including POCOs, message bodies and batches. An isolated `[FromBody]` parameter is a source only when the same function has an HTTP trigger. The request wrapper exposes `Body`, `Headers`, `Cookies`, `Url`, `Query`, and the SDK body-reading extensions; its function context and response factory remain outside the source model. ASP.NET Core-integrated `HttpRequest` uses the existing request model.
 
-Unannotated parameters, constructor services, `FunctionContext`, and `ServiceBusMessageActions` are not sources. Creating a `ServiceBusReceivedMessage` locally does not make it a source. HTTP route parameters without a binding attribute, other Azure trigger families, and the old in-process/WebJobs model are not covered by this entry-point model.
+Unannotated parameters, constructor services, `FunctionContext`, and `ServiceBusMessageActions` are not sources. Creating a `ServiceBusReceivedMessage` locally does not make it a source. HTTP route parameters without a binding attribute and the old in-process/WebJobs model are not covered by this entry-point model. Queue Storage, Event Grid and Event Hubs isolated-worker triggers are also supported; see [Azure Functions inputs](azure-functions-taint.md) for payload models and limits.
 
 The models are checked against the real .NET 8/10 framework and isolated-worker SDK assemblies. See the official [HTTP trigger](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-http-webhook-trigger) and [Service Bus trigger](https://learn.microsoft.com/en-us/azure/azure-functions/functions-bindings-service-bus-trigger) binding references.

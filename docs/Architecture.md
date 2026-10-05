@@ -2,8 +2,10 @@
 
 The analyzer package and the global tool share the same rule catalog and taint engine.
 The analyzer targets `netstandard2.0` so Roslyn can load it during a build. The
-.NET 10 tool loads C# projects through MSBuild, runs the same analyzers, and can
-write SARIF 2.1.0. The tool supports projects targeting .NET 8 or .NET 10.
+.NET 10 tool loads C# projects through MSBuild by default, or reconstructs
+conventional SDK project inputs with the experimental `-nb` mode. Both modes
+run the same analyzers and can write SARIF 2.1.0. The tool supports projects
+targeting .NET 8 or .NET 10. See [scan modes](scan-modes.md).
 
 ## Taint models
 
@@ -38,5 +40,7 @@ possible targets; the analyzer does not execute dependency injection.
 coverage. `tests/ModernSinkSmoke/` checks real provider APIs,
 `tests/RazorSmoke/` checks Razor and Blazor cases, and `tests/CliSmoke/`
 installs both packed NuGet packages and scans .NET 8 and .NET 10 fixtures.
-The build workflow runs the full suite on Windows and a packaged CLI smoke
-check on Linux.
+`tests/NoBuildSmoke/` checks experimental loading and partial-scan behavior;
+`tests/MarkupArchiveSmoke/` checks generated Razor/Markdown flows and archive
+extraction. The build workflow runs the unit suite and packaged smoke checks
+on Windows and Linux.
