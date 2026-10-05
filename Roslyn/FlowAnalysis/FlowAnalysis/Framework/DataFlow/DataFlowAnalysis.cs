@@ -59,6 +59,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
 
         private TAnalysisResult? Run(TAnalysisContext analysisContext)
         {
+            AnalysisWorkBudget.EnterGraph();
             var cfg = analysisContext.ControlFlowGraph;
             if (cfg?.SupportsFlowAnalysis() != true)
             {
@@ -211,6 +212,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
 
             while (worklist.Count > 0 || pendingBlocksNeedingAtLeastOnePass.Count > 0)
             {
+                AnalysisWorkBudget.VisitBlock();
                 UpdateUnreachableBlocks();
 
                 // Get the next block to process from the worklist.

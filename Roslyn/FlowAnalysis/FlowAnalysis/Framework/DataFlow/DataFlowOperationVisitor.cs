@@ -2817,6 +2817,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
             _recursionDepth++;
             try
             {
+                AnalysisWorkBudget.VisitOperation();
                 StackGuard.EnsureSufficientExecutionStack(_recursionDepth);
                 return operation.Accept(this, argument!)!;
             }

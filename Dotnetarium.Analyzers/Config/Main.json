@@ -1,6 +1,7 @@
 {
   "MaxInterproceduralMethodCallChain": 5,
   "MaxInterproceduralLambdaOrLocalFunctionCallChain": 5,
+  "MaxTaintAnalysisWork": 250000,
   "TaintFlowVisualizationEnabled": true,
   "TaintEntryPoints": {
     "System.Object": {

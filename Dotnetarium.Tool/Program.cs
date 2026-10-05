@@ -106,7 +106,10 @@ internal static class Program
                 {
                     var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
                     report.AnalyzedProjects.Add(project.Name);
-                    diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal)));
+                    diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal) &&
+                        diagnostic.Id != AnalysisDiagnostics.WorkLimitId));
+                    foreach (var notice in result.Where(diagnostic => diagnostic.Id == AnalysisDiagnostics.WorkLimitId))
+                        report.Warn("analysis-budget", $"{project.Name}: {notice}");
                     foreach (var error in result.Where(diagnostic => diagnostic.Id == "AD0001" ||
                         (diagnostic.Severity == DiagnosticSeverity.Error && !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal))))
                     {

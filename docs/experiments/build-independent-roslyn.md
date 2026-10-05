@@ -725,7 +725,7 @@ when receiver, arguments, complete input state, captures, caller dependencies an
 dependent analysis results match. The cache remains visitor-scoped and capped at
 32 entries. The measured reduction in points-to executions is approximately 27%;
 wall time improves approximately 10%. Taint summaries are not reused by this
-change, and the timeout is **not resolved**. The measured prototype process peaked
+change, and at this stage the timeout was **not resolved**. The measured prototype process peaked
 at approximately 1.05 GiB working set. Snapshotting and retaining bounded summaries
 adds memory/comparison work and does not prevent expansion when inputs change.
 
@@ -747,6 +747,40 @@ summaries and widening, including return values, heap/ref/capture effects and fl
 provenance. Blindly skipping recursive methods or removing the `System.Object`
 entry-point container would lose valid coverage. An eventual resource budget must
 report incomplete analysis explicitly; an interrupted run is not a clean scan.
+
+### Per-root work budget
+
+The engine now spends a shared work unit on each dataflow graph execution, basic
+block visit and operation visit. A root method and taint rule share a default
+250,000-unit budget across nested callbacks and prerequisite analyses. Exhaustion
+unwinds that root with a dedicated exception; normal cleanup runs, the aborted
+root result is not cached, and unrelated methods/rules retain their own budgets.
+Concurrent operation-block actions have independent synchronous scopes.
+
+The analyzer emits the coverage diagnostic `DNA9000`, identifying the affected
+method/rule and counters. The CLI translates it into an `analysis-budget` SARIF
+execution notification and marks coverage partial; it is not a vulnerability
+result and does not count toward `--fail`. Increase `MaxTaintAnalysisWork` in
+`dotnetarium.json` to retry. Zero/negative limits are rejected.
+
+The isolated LANCommander installer now returns in **8.54–9.09 seconds**, stopping
+at 250,001 units: 2,736 graph executions, 31,930 block visits and 215,335 operation
+visits. The repeated instrumented process peaked at approximately **0.35 GiB**
+working set. Its sole diagnostic is the coverage notice, not a security finding.
+No full-application timing or complete LANCommander finding set is claimed.
+
+All 691 unit tests pass, including concurrent/serial continuation, cancellation,
+scope restoration, heap-state reuse and retrying an aborted root without poisoned
+cache results. SharpSaster preserves its 41 complete findings and flows without
+budget notices. CLI fixtures check partial SARIF notifications and independent
+command-injection/crypto findings in both loading modes.
+
+**Tradeoff:** the cap deliberately sacrifices findings and flow traces inside an
+unfinished root so a pathological call tree cannot monopolize the scan. It does
+not classify recursive code as safe or provide recursive fixed-point summaries.
+Work spent on metadata, lookup proofs or waiting for shared caches is not a hard
+wall-clock/memory bound. Recursive summaries remain an accuracy/performance
+improvement to pursue separately; the work budget supplies a practical fallback.
 
 ## Next experiment and promotion gates
 

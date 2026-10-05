@@ -23,7 +23,7 @@ namespace Dotnetarium.Analyzers.Taint
         protected virtual bool IsSinkRelevant(Location location, Compilation compilation) => true;
 
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-            ImmutableArray.Create(TaintedDataEnteringSinkDescriptor);
+            ImmutableArray.Create(TaintedDataEnteringSinkDescriptor, AnalysisDiagnostics.WorkLimit);
 
         public override void Initialize(AnalysisContext context)
         {
@@ -78,7 +78,21 @@ namespace Dotnetarium.Analyzers.Taint
             if (!settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(graph, block.CancellationToken))
                 return;
 
-            AnalyzeGraph(graph, block.OwningSymbol);
+            using var budget = new AnalysisWorkBudget(settings.MaxTaintAnalysisWork, block.CancellationToken);
+            try
+            {
+                AnalyzeGraph(graph, block.OwningSymbol);
+            }
+            catch (AnalysisWorkLimitException error) when (ReferenceEquals(error.Budget, budget))
+            {
+                block.ReportDiagnostic(Diagnostic.Create(AnalysisDiagnostics.WorkLimit,
+                    block.OwningSymbol.Locations.FirstOrDefault(location => location.IsInSource) ?? graph.OriginalOperation.Syntax.GetLocation(),
+                    properties: ImmutableDictionary<string, string>.Empty
+                        .Add("dotnetarium.coverage", "partial")
+                        .Add("dotnetarium.rule", TaintedDataEnteringSinkDescriptor.Id),
+                    messageArgs: new object[] { TaintedDataEnteringSinkDescriptor.Id, block.OwningSymbol.ToDisplayString(),
+                        budget.Work, budget.Limit, budget.Graphs, budget.Blocks, budget.Operations }));
+            }
 
             void AnalyzeGraph(Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowGraph currentGraph, ISymbol owner)
             {

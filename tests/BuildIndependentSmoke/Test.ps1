@@ -90,6 +90,49 @@ if ($ids.Count -ne 3 -or $ids -notcontains 'DNA0002' -or $ids -notcontains 'DNA0
     throw ('Unexpected positive/negative baseline: ' + ($ids -join ', '))
 }
 if ($direct.runs[0].invocations[0].properties.'dotnetarium.coverage' -ne 'complete') { throw 'Clean direct scan should have complete reconstructed inputs.' }
+
+# A runaway root must produce a coverage notification while other methods and
+# rules continue. The coverage notice must never become a vulnerability result.
+$budgetRoot = Join-Path $scratch 'budget'
+New-Item -ItemType Directory -Path $budgetRoot -Force | Out-Null
+$budgetProject = Join-Path $budgetRoot 'Budget.csproj'
+'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>' |
+    Set-Content -LiteralPath $budgetProject -Encoding utf8
+@'
+using System;
+using System.Diagnostics;
+using System.Security.Cryptography;
+public static class Demo {
+    static string Walk(string input, int count) {
+        if (count > 0) { input = Walk(input, count - 1); input = Walk(input, count - 1); }
+        return input;
+    }
+    public static void Expensive(int count) => Process.Start(Walk(Console.ReadLine(), count));
+    public static void Ordinary() => Process.Start(Console.ReadLine());
+    public static void Crypto() { using var aes = Aes.Create(); aes.Mode = CipherMode.ECB; }
+}
+'@ | Set-Content -LiteralPath (Join-Path $budgetRoot 'Demo.cs') -Encoding utf8
+$budgetConfig = Join-Path $budgetRoot 'dotnetarium.json'
+'{"Version":"2.0","MaxTaintAnalysisWork":1000}' | Set-Content -LiteralPath $budgetConfig -Encoding utf8
+& dotnet restore $budgetProject --nologo -v quiet 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Budget fixture restore failed.' }
+foreach ($budgetDirect in @($false, $true)) {
+    $budgetReport = Scan $budgetProject $budgetDirect 1 $true @('--config', $budgetConfig)
+    $budgetFindings = @($budgetReport.runs[0].results)
+    if ($budgetFindings.Count -ne 2 -or @($budgetFindings | Where-Object ruleId -eq 'DNA0002').Count -ne 1 -or
+        @($budgetFindings | Where-Object ruleId -eq 'DNA0014').Count -ne 1 -or
+        -not (HasNotice $budgetReport 'analysis-budget') -or
+        $budgetReport.runs[0].invocations[0].properties.'dotnetarium.coverage' -ne 'partial') {
+        throw 'Budget exhaustion lost independent findings or was not represented as partial coverage.'
+    }
+    $budgetNotice = @($budgetReport.runs[0].invocations[0].toolExecutionNotifications |
+        Where-Object { $_.descriptor.id -eq 'analysis-budget' })
+    if (-not ($budgetNotice.message.text -match 'Demo.Expensive') -or
+        -not (@($budgetFindings | Where-Object ruleId -eq 'DNA0002')[0].message.text -match 'Ordinary')) {
+        throw 'Budget notification or independent finding did not identify its method.'
+    }
+}
+
 $inputBaseline = $baseline.inputInventory.projects[0]
 $inputDirect = $direct.inputInventory.projects[0]
 if ($inputDirect.targetFramework -ne 'net10.0' -or $inputDirect.configuration -ne 'Debug' -or

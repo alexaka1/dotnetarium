@@ -44,6 +44,34 @@ Project models add to the built-ins. Configure severity and suppression with `.e
 
 Configuration cannot express arbitrary code flow or whole-application dependency injection resolution. Review findings involving reflection, runtime registrations, and external assemblies with the appropriate deployment context.
 
+## Taint analysis work limit
+
+Each root method and taint rule has a default budget of **250,000 work units**,
+shared by its nested points-to, value-content and taint analyses. Entering a
+dataflow graph, visiting a basic block or visiting an operation spends one unit.
+This bounds repeated expansion of recursive or branching call trees without
+classifying all recursive code as unsafe or skipping every recursive method.
+
+When the limit is reached, analysis stops for that root and other methods and
+rules continue. The analyzer package emits **DNA9000**, identifying the rule,
+method and work counters. This is a coverage notice, not a security finding.
+The global tool writes an `analysis-budget` SARIF execution notification and
+marks the scan **partial**. Its finding count and `--fail` behavior continue to
+apply to security findings; zero findings in a partial scan is not a clean result.
+
+To retry with a larger budget, set a positive integer in `dotnetarium.json`:
+
+```json
+{
+  "Version": "2.0",
+  "MaxTaintAnalysisWork": 2000000
+}
+```
+
+Increasing the budget permits more work and can increase runtime and memory.
+This is a work limit, not a hard wall-clock or process-memory limit. Completed
+findings remain valid, but flows inside an aborted analysis may be missing.
+
 Built-in ASP.NET Core inputs include MVC controllers, Razor Pages, Blazor binding, Minimal API lambdas or named handlers, generated gRPC service overrides, and gRPC server interceptor overrides. Minimal APIs model explicit request binding, parsable parameters, upload files, and body streams. `MapPost`, `MapPut`, and `MapPatch` also infer JSON body inputs when no visible service registration or custom binder takes precedence. Explicit service attributes and visible service registrations are excluded. Mixed `[AsParameters]` aggregates preserve separate request and service members. Registrations hidden in external DI setup require an explicit service attribute to avoid assuming an implicit body. Custom binders and implicit bodies on `MapMethods` are not inferred. For gRPC details and limits, see [gRPC taint analysis](grpc-taint.md).
 
 SignalR hub methods and client upload streams are also entry points. Their binding model excludes explicit and visible implicit service parameters; see [SignalR taint analysis](signalr-taint.md) for supported registrations and limits.

@@ -37,8 +37,11 @@ namespace Dotnetarium.Config
             using var document = JsonDocument.Parse(content);
             if (validate)
                 CheckDistinctKeys(document.RootElement);
-            return JsonSerializer.Deserialize<T>(content, Options)
+            var result = JsonSerializer.Deserialize<T>(content, Options)
                 ?? throw new JsonException("Dotnetarium configuration must be a JSON object.");
+            if (result is ConfigData { MaxTaintAnalysisWork: 0 })
+                throw new JsonException("MaxTaintAnalysisWork must be greater than zero.");
+            return result;
         }
 
         private static void CheckDistinctKeys(JsonElement element)
@@ -133,6 +136,7 @@ namespace Dotnetarium.Config
             target.MaxInterproceduralLambdaOrLocalFunctionCallChain =
                 overlay.MaxInterproceduralLambdaOrLocalFunctionCallChain ??
                 target.MaxInterproceduralLambdaOrLocalFunctionCallChain;
+            target.MaxTaintAnalysisWork = overlay.MaxTaintAnalysisWork ?? target.MaxTaintAnalysisWork;
 
             if (overlay.TaintEntryPoints != null)
             {

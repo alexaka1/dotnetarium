@@ -81,6 +81,21 @@ public sealed class ConfigurationTests
         Assert.Equal("2.0", project.Version);
     }
 
+    [Fact]
+    public void Work_budget_is_positive_and_project_overrides_the_default()
+    {
+        var reader = new ConfigurationReader();
+        var merged = new ConfigData();
+        merged.Merge(reader.GetBuiltinConfiguration());
+        Assert.Equal(250000u, merged.MaxTaintAnalysisWork);
+        merged.Merge(reader.GetProjectConfiguration([new TextFile("dotnetarium.json",
+            """{"Version":"2.0","MaxTaintAnalysisWork":2000000}""")]));
+        Assert.Equal(2000000u, merged.MaxTaintAnalysisWork);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("""{"MaxTaintAnalysisWork":0}"""));
+        using var text = new StreamReader(stream);
+        Assert.Throws<System.Text.Json.JsonException>(() => reader.DeserializeAndValidate<ConfigData>(text, true));
+    }
+
     private sealed class TextFile(string path, string text) : AdditionalText
     {
         public override string Path => path;
