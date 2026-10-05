@@ -47,6 +47,11 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.PointsToAnalysis
 
             internal TrackedEntitiesBuilder TrackedEntitiesBuilder { get; }
 
+            protected override bool ReuseCompletedInvocations => true;
+
+            protected override bool InvocationInputsEqual(PointsToAnalysisData left, PointsToAnalysisData right) =>
+                left.IsReachableBlockData == right.IsReachableBlockData && _pointsToAnalysisDomain.Equals(left, right);
+
             public ImmutableDictionary<IOperation, ImmutableHashSet<AbstractLocation>> GetEscapedLocationsThroughOperationsMap()
                 => GetEscapedAbstractLocationsMapAndFreeBuilder(_escapedOperationLocationsBuilder);
 

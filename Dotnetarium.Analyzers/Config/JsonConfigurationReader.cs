@@ -23,6 +23,7 @@ namespace Dotnetarium.Config
                 PropertyNameCaseInsensitive = true,
                 UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
             };
+            options.Converters.Add(new JsonStringEnumConverter<SourceScope>(allowIntegerValues: false));
             options.Converters.Add(new JsonStringEnumConverter());
             options.Converters.Add(new StringPairArrayConverter());
             options.Converters.Add(new IntObjectPairArrayConverter());
@@ -37,8 +38,14 @@ namespace Dotnetarium.Config
             using var document = JsonDocument.Parse(content);
             if (validate)
                 CheckDistinctKeys(document.RootElement);
-            return JsonSerializer.Deserialize<T>(content, Options)
+            var result = JsonSerializer.Deserialize<T>(content, Options)
                 ?? throw new JsonException("Dotnetarium configuration must be a JSON object.");
+            if (result is ConfigData { MaxTaintAnalysisWork: 0 })
+                throw new JsonException("MaxTaintAnalysisWork must be greater than zero.");
+            if (result is ConfigData { ThreatModels: { } scopes } &&
+                (scopes.Count == 0 || scopes.Contains(SourceScope.Independent)))
+                throw new JsonException("ThreatModels must contain remote, local, or both. Independent is a source scope, not a selectable threat model.");
+            return result;
         }
 
         private static void CheckDistinctKeys(JsonElement element)
@@ -133,6 +140,9 @@ namespace Dotnetarium.Config
             target.MaxInterproceduralLambdaOrLocalFunctionCallChain =
                 overlay.MaxInterproceduralLambdaOrLocalFunctionCallChain ??
                 target.MaxInterproceduralLambdaOrLocalFunctionCallChain;
+            target.MaxTaintAnalysisWork = overlay.MaxTaintAnalysisWork ?? target.MaxTaintAnalysisWork;
+            target.ThreatModels = overlay.ThreatModels != null
+                ? new HashSet<SourceScope>(overlay.ThreatModels) : target.ThreatModels;
 
             if (overlay.TaintEntryPoints != null)
             {

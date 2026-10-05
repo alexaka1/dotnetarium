@@ -23,7 +23,7 @@ namespace Dotnetarium.Analyzers.Taint
         protected virtual bool IsSinkRelevant(Location location, Compilation compilation) => true;
 
         public override ImmutableArray<DiagnosticDescriptor> SupportedDiagnostics =>
-            ImmutableArray.Create(TaintedDataEnteringSinkDescriptor);
+            ImmutableArray.Create(TaintedDataEnteringSinkDescriptor, AnalysisDiagnostics.WorkLimit);
 
         public override void Initialize(AnalysisContext context)
         {
@@ -57,6 +57,8 @@ namespace Dotnetarium.Analyzers.Taint
             TaintedDataSymbolMap<SanitizerInfo> sanitizers,
             TaintedDataSymbolMap<SinkInfo> sinks)
         {
+            if (MigrationAnalysisExclusion.IsExcluded(block.OwningSymbol))
+                return;
             if (AnalyzeRazorGeneratedCode && block.OperationBlocks.All(root =>
                 IsUnrelatedGeneratedFile(root.Syntax.SyntaxTree.FilePath)))
                 return;
@@ -68,14 +70,29 @@ namespace Dotnetarium.Analyzers.Taint
                     block.CancellationToken))
                 return;
 
-            if (!ContainsPotentialSource(block.OperationBlocks, sources, block.Compilation))
-                return;
-
             var graph = block.OperationBlocks.GetControlFlowGraph();
             if (graph == null)
                 return;
 
-            AnalyzeGraph(graph, block.OwningSymbol);
+            using var budget = new AnalysisWorkBudget(settings.MaxTaintAnalysisWork, block.CancellationToken);
+            try
+            {
+                if (!settings.TaintConfiguration.GetSinkReachability(kind).MayReachSink(graph, block.CancellationToken))
+                    return;
+                if (!settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(graph, block.CancellationToken))
+                    return;
+                AnalyzeGraph(graph, block.OwningSymbol);
+            }
+            catch (AnalysisWorkLimitException error) when (ReferenceEquals(error.Budget, budget))
+            {
+                block.ReportDiagnostic(Diagnostic.Create(AnalysisDiagnostics.WorkLimit,
+                    block.OwningSymbol.Locations.FirstOrDefault(location => location.IsInSource) ?? graph.OriginalOperation.Syntax.GetLocation(),
+                    properties: ImmutableDictionary<string, string>.Empty
+                        .Add("dotnetarium.coverage", "partial")
+                        .Add("dotnetarium.rule", TaintedDataEnteringSinkDescriptor.Id),
+                    messageArgs: new object[] { TaintedDataEnteringSinkDescriptor.Id, block.OwningSymbol.ToDisplayString(),
+                        budget.Work, budget.Limit, budget.Graphs, budget.Blocks, budget.Operations }));
+            }
 
             void AnalyzeGraph(Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowGraph currentGraph, ISymbol owner)
             {
@@ -83,11 +100,13 @@ namespace Dotnetarium.Analyzers.Taint
                 // their nested CFGs as well as ordinary stored route delegates.
                 var types = WellKnownTypeProvider.GetOrCreate(block.Compilation);
                 foreach (var lambda in currentGraph.DescendantOperations<IFlowAnonymousFunctionOperation>(OperationKind.FlowAnonymousFunction))
+                {
+                    var lambdaGraph = currentGraph.GetAnonymousFunctionControlFlowGraph(lambda);
                     if (lambda.Symbol.Parameters.Any(parameter => sources.IsSourceParameter(parameter, types) ||
                             parameter.GetAttributes().Any(attribute => attribute.AttributeClass?.ToDisplayString() == "Microsoft.AspNetCore.Http.AsParametersAttribute")) ||
-                        block.Compilation.GetSemanticModel(lambda.Syntax.SyntaxTree).GetOperation(lambda.Syntax) is { } body &&
-                            ContainsPotentialSource(ImmutableArray.Create(body), sources, block.Compilation))
-                        AnalyzeGraph(currentGraph.GetAnonymousFunctionControlFlowGraph(lambda), lambda.Symbol);
+                        settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(lambdaGraph, block.CancellationToken))
+                        AnalyzeGraph(lambdaGraph, lambda.Symbol);
+                }
                 var result = TaintedDataAnalysis.TryGetOrComputeResult(
                     currentGraph,
                     block.Compilation,
@@ -103,6 +122,10 @@ namespace Dotnetarium.Analyzers.Taint
                 if (result == null)
                     return;
 
+                bool IsTainted(IOperation operation) => result[operation.Kind, operation.Syntax].Kind == TaintedDataAbstractValueKind.Tainted ||
+                    operation is IPropertyReferenceOperation property && sources.IsSourceProperty(property) ||
+                    operation is IFieldReferenceOperation field && sources.IsSourceField(field);
+
                 foreach (var pair in result.TaintedDataSourceSinks)
                 {
                     if (!pair.SinkKinds.Contains(kind))
@@ -110,10 +133,14 @@ namespace Dotnetarium.Analyzers.Taint
                     if (!IsSinkRelevant(pair.Sink.Location, block.Compilation)) continue;
                     if (BoundaryValidation.HasConstantAllowlist(pair.Sink.Location, block.Compilation)) continue;
                     if (kind == (SinkKind)(int)TaintType.PathEscape && BoundaryValidation.HasCanonicalPathRoot(pair.Sink.Location, block.Compilation)) continue;
+                    if (kind == (SinkKind)(int)TaintType.PathEscape && BoundaryValidation.HasValidatedFileName(pair.Sink.Location, block.Compilation)) continue;
+                    if (kind == (SinkKind)(int)TaintType.PathEscape && BoundaryValidation.HasContainedBaseName(pair.Sink.Location, block.Compilation, IsTainted)) continue;
                     if (kind == (SinkKind)(int)TaintType.ServerSideRequestForgery && BoundaryValidation.HasFixedRequestAuthority(pair.Sink.Location, block.Compilation)) continue;
 
                     if (kind == (SinkKind)(int)TaintType.OpenRedirect &&
-                        LocalRedirectGuard.Protects(pair.Sink.Location, block.Compilation))
+                        (LocalRedirectGuard.Protects(pair.Sink.Location, block.Compilation) ||
+                         BoundaryValidation.HasFixedRedirectDestination(pair.Sink.Location, block.Compilation) ||
+                         BoundaryValidation.HasConfiguredRedirectOrigin(pair.Sink.Location, block.Compilation, IsTainted)))
                         continue;
 
                     foreach (var origin in pair.SourceOrigins)
@@ -139,35 +166,6 @@ namespace Dotnetarium.Analyzers.Taint
                     }
                 }
             }
-        }
-
-        private static bool ContainsPotentialSource(
-            ImmutableArray<IOperation> roots,
-            TaintedDataSymbolMap<SourceInfo> sources,
-            Compilation compilation)
-        {
-            var types = WellKnownTypeProvider.GetOrCreate(compilation);
-            foreach (var root in roots)
-            {
-                foreach (var operation in root.DescendantsAndSelf())
-                {
-                    switch (operation)
-                    {
-                        case IPropertyReferenceOperation property when
-                            sources.IsSourceProperty(property):
-                        case IFieldReferenceOperation field when
-                            sources.IsSourceField(field):
-                        case IParameterReferenceOperation parameter when
-                            sources.IsSourceParameter(parameter.Parameter, types):
-                            return true;
-                        case IInvocationOperation call when
-                            sources.GetInfosForType(call.TargetMethod.ContainingType).Any():
-                            return true;
-                    }
-                }
-            }
-
-            return false;
         }
 
         private static bool IsUnrelatedGeneratedFile(string path) =>

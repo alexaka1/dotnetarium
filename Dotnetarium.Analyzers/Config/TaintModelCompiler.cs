@@ -33,18 +33,22 @@ namespace Dotnetarium.Config
             MaxInterproceduralLambdaOrLocalFunctionCallChain =
                 data.MaxInterproceduralLambdaOrLocalFunctionCallChain ?? 5;
             TaintFlowVisualizationEnabled = data.TaintFlowVisualizationEnabled ?? true;
+            MaxTaintAnalysisWork = data.MaxTaintAnalysisWork ?? 10000;
             TaintConfiguration = new TaintConfiguration(data, compilation, options);
         }
 
         public uint MaxInterproceduralMethodCallChain { get; }
         public uint MaxInterproceduralLambdaOrLocalFunctionCallChain { get; }
         public bool TaintFlowVisualizationEnabled { get; }
+        public uint MaxTaintAnalysisWork { get; }
         public TaintConfiguration TaintConfiguration { get; }
     }
 
     internal sealed class TaintConfiguration
     {
         private readonly ConfigData model;
+        private readonly bool remoteEnabled;
+        private readonly bool localEnabled;
         private readonly Compilation compilation;
         private readonly Lazy<ImmutableDictionary<IMethodSymbol, bool>> minimalApiHandlers;
         private readonly Lazy<SignalRInputModel> signalRInputs;
@@ -56,10 +60,14 @@ namespace Dotnetarium.Config
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SourceInfo>> sourceMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SanitizerInfo>> sanitizerMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SinkInfo>> sinkMaps = new();
+        private readonly ConcurrentDictionary<SinkKind, SinkReachability> sinkReachability = new();
+        private readonly ConcurrentDictionary<SinkKind, SourceReachability> sourceReachability = new();
 
         public TaintConfiguration(ConfigData model, Compilation compilation, AnalyzerOptions options)
         {
             this.model = model;
+            remoteEnabled = model.ThreatModels == null || model.ThreatModels.Contains(SourceScope.Remote);
+            localEnabled = model.ThreatModels?.Contains(SourceScope.Local) == true;
             this.compilation = compilation;
             minimalApiHandlers = new Lazy<ImmutableDictionary<IMethodSymbol, bool>>(FindMinimalApiHandlers);
             signalRInputs = new Lazy<SignalRInputModel>(() => new SignalRInputModel(compilation));
@@ -79,8 +87,22 @@ namespace Dotnetarium.Config
         public TaintedDataSymbolMap<SinkInfo> GetSinkSymbolMap(SinkKind kind) =>
             sinkMaps.GetOrAdd(kind, current => new TaintedDataSymbolMap<SinkInfo>(types, CompileSinks(current)));
 
+        internal SinkReachability GetSinkReachability(SinkKind kind) =>
+            sinkReachability.GetOrAdd(kind, current => new SinkReachability(compilation, GetSinkSymbolMap(current)));
+
+        internal SourceReachability GetSourceReachability(SinkKind kind) =>
+            sourceReachability.GetOrAdd(kind, current => new SourceReachability(compilation, GetSourceSymbolMap(current)));
+
         private static bool Applies(HashSet<TaintType> contexts, SinkKind kind) =>
             contexts == null || contexts.Any(context => (int)context == (int)kind);
+
+        private bool Includes(SourceScope scope) => scope switch
+        {
+            SourceScope.Remote => remoteEnabled,
+            SourceScope.Local => localEnabled,
+            SourceScope.Independent => true,
+            _ => false
+        };
 
         private ImmutableHashSet<SourceInfo> CompileSources(SinkKind kind)
         {
@@ -93,10 +115,11 @@ namespace Dotnetarium.Config
             }
 
             foreach (var entry in model.TaintEntryPoints ?? new Dictionary<string, TaintEntryPointData>())
-                For(entry.Value.SourceType ?? entry.Key).EntryPoints.Add(entry.Value);
+                if (Includes(entry.Value.Scope))
+                    For(entry.Value.SourceType ?? entry.Key).EntryPoints.Add(entry.Value);
             foreach (var source in model.TaintSources ?? new List<TaintSource>())
-                if (Applies(source.TaintTypes, kind))
-                    For(source.Type).Source = source;
+                if (Includes(source.Scope) && Applies(source.TaintTypes, kind))
+                    For(source.Type).Sources.Add(source);
             foreach (var transfer in model.Transfers ?? new List<Transfer>())
             {
                 var definition = For(transfer.Type);
@@ -116,15 +139,16 @@ namespace Dotnetarium.Config
             var compiled = ImmutableHashSet.CreateBuilder<SourceInfo>();
             foreach (var (type, definition) in definitions)
             {
-                var source = definition.Source;
+                var sources = definition.Sources;
                 var entries = definition.EntryPoints;
-                bool isInterface = source?.IsInterface == true || definition.IsInterface;
-                var methods = (source?.Methods ?? Array.Empty<string>())
+                bool isInterface = sources.Any(source => source.IsInterface == true) || definition.IsInterface;
+                var methods = sources.SelectMany(source => source.Methods ?? Array.Empty<string>())
+                    .Distinct(StringComparer.Ordinal)
                     .Select<string, (MethodMatcher, ImmutableHashSet<string>)>(name =>
                         ((methodName, _) => methodName == name,
                          ImmutableHashSet<string>.Empty.Add(TaintedTargetValue.Return)))
                     .ToImmutableHashSet();
-                if (type == "Microsoft.AspNetCore.Http.EndpointFilterInvocationContext")
+                if (remoteEnabled && type == "Microsoft.AspNetCore.Http.EndpointFilterInvocationContext")
                     methods = methods.Add(((name, arguments) => name == "GetArgument" && arguments.Length == 1 &&
                         endpointFilters.Value.GetBoundParameters(arguments[0].Parent).Any(parameter => IsMinimalApiInputParameter(parameter, compilation)),
                         ImmutableHashSet<string>.Empty.Add(TaintedTargetValue.Return)));
@@ -133,14 +157,14 @@ namespace Dotnetarium.Config
                     .Select(method =>
                         ((MethodMatcher)((name, args) => name == method.Name &&
                             (!method.ArgumentCount.HasValue || args.Length == method.ArgumentCount.Value)),
-                         method.InOut.Where(pair => pair.outArgumentName != TaintedTargetValue.Return)
+                         method.InOut
                                      .Select(pair => (pair.inArgumentName, pair.outArgumentName))
                                      .ToImmutableHashSet()))
                     .ToImmutableHashSet();
 
-                bool allMembers = source != null && source.Methods == null && source.Properties == null &&
+                bool allMembers = sources.Any(source => source.Methods == null && source.Properties == null &&
                     source.PropertyAttributes == null && source.ServerPropertyAttributes == null &&
-                    source.PreserveTaintOnConversion != true && source.RoutedParameters != true;
+                    source.PreserveTaintOnConversion != true && source.RoutedParameters != true);
                 if (allMembers)
                 {
                     compiled.Add(new SourceInfo(
@@ -165,7 +189,7 @@ namespace Dotnetarium.Config
                 compiled.Add(new SourceInfo(
                     type,
                     isInterface,
-                    taintedProperties: (source?.Properties ?? Array.Empty<string>())
+                    taintedProperties: sources.SelectMany(source => source.Properties ?? Array.Empty<string>())
                         .ToImmutableHashSet(StringComparer.Ordinal),
                     taintedArguments: parameters,
                     taintedMethods: methods,
@@ -178,21 +202,21 @@ namespace Dotnetarium.Config
                     taintConstantArray: false,
                     constantArrayLengthMatcher: null,
                     dependencyFullTypeNames: entries.Count == 1 ? entries[0].Dependency?.ToImmutableArray() : null,
-                    taintedPropertyAttributes: (source?.PropertyAttributes ?? Array.Empty<string>())
+                    taintedPropertyAttributes: sources.SelectMany(source => source.PropertyAttributes ?? Array.Empty<string>())
                         .ToImmutableHashSet(StringComparer.Ordinal),
-                    preserveTaintOnConversion: source?.PreserveTaintOnConversion ?? false,
-                    taintRoutedParameters: source?.RoutedParameters ?? false,
-                    serverBoundPropertyAttributes: (source?.ServerPropertyAttributes ?? Array.Empty<string>())
+                    preserveTaintOnConversion: sources.Any(source => source.PreserveTaintOnConversion == true),
+                    taintRoutedParameters: sources.Any(source => source.RoutedParameters == true),
+                    serverBoundPropertyAttributes: sources.SelectMany(source => source.ServerPropertyAttributes ?? Array.Empty<string>())
                         .ToImmutableHashSet(StringComparer.Ordinal),
-                    propertyReferenceMatcher: property =>
+                    propertyReferenceMatcher: property => remoteEnabled && (
                         (type == "System.Object" && IsMixedAggregateRequestProperty(property)) ||
                         endpointFilters.Value.GetBoundParameters(property).Any(parameter => IsMinimalApiInputParameter(parameter, compilation)) ||
-                        messageInputs.Value.IsPropertyInput(property),
-                    fieldReferenceMatcher: field => messageInputs.Value.IsFieldInput(field),
-                    propertyValueProvider: property => GetBinderPropertyValue(property, kind) ??
-                        (kind == (SinkKind)(int)TaintType.CrossSiteScripting ? componentInputs.Value.GetPropertyInput(property) : null),
-                    fieldValueProvider: field => GetBinderMemberValue(field.Field, field.Instance, kind) ??
-                        (kind == (SinkKind)(int)TaintType.CrossSiteScripting ? componentInputs.Value.GetFieldInput(field) : null)));
+                        messageInputs.Value.IsPropertyInput(property)),
+                    fieldReferenceMatcher: field => remoteEnabled && messageInputs.Value.IsFieldInput(field),
+                    propertyValueProvider: property => remoteEnabled ? GetBinderPropertyValue(property, kind) ??
+                        (kind == (SinkKind)(int)TaintType.CrossSiteScripting ? componentInputs.Value.GetPropertyInput(property) : null) : null,
+                    fieldValueProvider: field => remoteEnabled ? GetBinderMemberValue(field.Field, field.Instance, kind) ??
+                        (kind == (SinkKind)(int)TaintType.CrossSiteScripting ? componentInputs.Value.GetFieldInput(field) : null) : null));
             }
 
             return compiled.ToImmutable();
@@ -206,7 +230,7 @@ namespace Dotnetarium.Config
             if (entry.Dependency != null && entry.Dependency.Any(dependency =>
                 !provider.TryGetOrCreateTypeByMetadataName(dependency, out _)))
                 return false;
-            if (entry.Parameter?.Binding == null && entry.Parameter?.Types == null && entry.Parameter?.Names == null &&
+            if (remoteEnabled && entry.Parameter?.Binding == null && entry.Parameter?.Types == null && entry.Parameter?.Names == null &&
                 IsMinimalApiInputParameter(parameter, compilation))
                 return true;
             if (parameter.ContainingSymbol is not IMethodSymbol method ||
@@ -300,6 +324,8 @@ namespace Dotnetarium.Config
                 "AzureFunctions" => IsAzureFunctionInput(parameter, method),
                 "Messaging" => messageInputs.Value.IsParameterInput(parameter),
                 "Blazor" => componentInputs.Value.IsParameterInput(parameter),
+                "CommandLine" => SymbolEqualityComparer.Default.Equals(method, compilation.GetEntryPoint(default)) &&
+                    parameter.Type is IArrayTypeSymbol { ElementType.SpecialType: SpecialType.System_String },
                 _ => true
             };
         }
@@ -331,6 +357,8 @@ namespace Dotnetarium.Config
 
         private bool IsMinimalApiInputParameter(IParameterSymbol parameter, Compilation compilation)
         {
+            if (!remoteEnabled)
+                return false;
             if (HasServiceBindingAttribute(parameter))
                 return false;
 
@@ -376,9 +404,10 @@ namespace Dotnetarium.Config
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             var isLambdaHandler = argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
                 argument == invocation.ArgumentList.Arguments.LastOrDefault() &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 IsMinimalApiMapMethod(compilation.GetSemanticModel(invocation.SyntaxTree)
                     .GetSymbolInfo(invocation).Symbol as IMethodSymbol);
-            var isNamedHandler = parameter.ContainingSymbol is IMethodSymbol owner &&
+            var isNamedHandler = parameter.ContainingSymbol is IMethodSymbol { MethodKind: not MethodKind.AnonymousFunction } owner &&
                 minimalApiHandlers.Value.ContainsKey(owner);
             return isLambdaHandler || isNamedHandler;
         }
@@ -389,6 +418,7 @@ namespace Dotnetarium.Config
             var lambda = syntax?.AncestorsAndSelf().OfType<LambdaExpressionSyntax>().FirstOrDefault();
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             if (argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 compilation.GetSemanticModel(invocation.SyntaxTree).GetSymbolInfo(invocation).Symbol is IMethodSymbol map)
                 return SupportsInferredBody(map);
             return parameter.ContainingSymbol is IMethodSymbol owner &&
@@ -443,8 +473,10 @@ namespace Dotnetarium.Config
         {
             var direct = MessageInputModel.StableParameter(instance, compilation);
             var parameters = direct != null ? new[] { direct } : endpointFilters.Value.GetBoundParameters(instance);
-            var values = parameters.Where(parameter => !HasServiceBindingAttribute(parameter) && IsMinimalApiHandlerParameter(parameter) &&
-                    parameter.Type is INamedTypeSymbol bound && HasCustomRequestBinder(bound))
+            // Ordinary DTO properties cannot be custom-binder inputs. Check
+            // their type before triggering compilation-wide handler discovery.
+            var values = parameters.Where(parameter => parameter.Type is INamedTypeSymbol bound && HasCustomRequestBinder(bound) &&
+                    !HasServiceBindingAttribute(parameter) && IsMinimalApiHandlerParameter(parameter))
                 .Select(parameter => binderInputs.GetMemberInput((INamedTypeSymbol)parameter.Type, member, kind))
                 .Where(value => value != null).ToArray();
             return values.Length == 0 ? null : TaintedDataAbstractValue.MergeTainted(values!);
@@ -508,6 +540,10 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var invocation in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (!IsMinimalApiMapSyntax(invocation.Expression)) continue;
+                    // Lambda handlers are checked at their parameter syntax;
+                    // only method groups can populate this named-handler map.
+                    if (invocation.ArgumentList.Arguments.LastOrDefault()?.Expression is AnonymousFunctionExpressionSyntax) continue;
                     var map = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
                     if (!IsMinimalApiMapMethod(map) ||
                         invocation.ArgumentList.Arguments.LastOrDefault() is not { } handlerArgument)
@@ -524,9 +560,15 @@ namespace Dotnetarium.Config
             return handlers.ToImmutable();
         }
 
+        private static bool IsMinimalApiMapSyntax(ExpressionSyntax expression) =>
+            IsMinimalApiMapName(InvocationSyntax.Name(expression));
+
         private static bool IsMinimalApiMapMethod(IMethodSymbol? method) =>
             method != null && method.ContainingNamespace.ToDisplayString() == "Microsoft.AspNetCore.Builder" &&
-            method.Name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
+            IsMinimalApiMapName(method.Name);
+
+        private static bool IsMinimalApiMapName(string? name) =>
+            name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
                 "MapPatch" or "MapMethods" or "MapFallback";
 
         private static bool HasAnyTypeAttribute(
@@ -677,7 +719,7 @@ namespace Dotnetarium.Config
         private sealed class SourceDefinition
         {
             public List<TaintEntryPointData> EntryPoints { get; } = new List<TaintEntryPointData>();
-            public TaintSource Source { get; set; }
+            public List<TaintSource> Sources { get; } = new List<TaintSource>();
             public bool IsInterface { get; set; }
             public List<TransferInfo> Transfers { get; } = new List<TransferInfo>();
         }

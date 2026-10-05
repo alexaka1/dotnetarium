@@ -44,6 +44,91 @@ Project models add to the built-ins. Configure severity and suppression with `.e
 
 Configuration cannot express arbitrary code flow or whole-application dependency injection resolution. Review findings involving reflection, runtime registrations, and external assemblies with the appropriate deployment context.
 
+## Input scope
+
+Remote sources are enabled by default. To include console input, process
+arguments and environment values, add:
+
+```json
+{
+  "Version": "2.0",
+  "ThreatModels": [ "remote", "local" ]
+}
+```
+
+`ThreatModels` replaces the default selection; `["local"]` scans local sources
+only. The CLI uses the same configuration through project discovery or `--config`;
+no separate CLI flag is needed. Source and entry-point models accept `Scope`
+(`remote`, `local`, or `independent`). An omitted `Scope` defaults to `remote`,
+including existing custom models. `independent` is for intentionally unconditional
+origins or propagation models and cannot appear in `ThreatModels`. Unknown values,
+numeric scopes and an empty selection are rejected.
+
+For a custom local source:
+
+```json
+{
+  "Version": "2.0",
+  "ThreatModels": [ "remote", "local" ],
+  "TaintSources": [
+    { "Type": "Example.Settings", "Scope": "local", "Methods": [ "ReadCommand" ] }
+  ]
+}
+```
+
+See [input origin and threat scope](taint-validation.md#input-origin-and-threat-scope)
+for the covered APIs, trust boundaries and implementation plan. The default
+changed: stdin-based flows require opting into local sources. Local scope does
+not automatically treat all files or database reads as sources.
+
+## EF migration scope
+
+Entity Framework migrations and model snapshots are excluded from taint analysis.
+The exclusion recognizes inheritance from EF's `Migration` and `ModelSnapshot`,
+including indirect inheritance, partial classes, callbacks and nested helper
+types. Their bodies are also excluded when called from ordinary code. A folder
+or class merely named `Migrations`/`Migration` does not trigger the exclusion.
+
+Direct rules continue to run. Hard-coded credential detection checks literal
+strings, constants and constant arrays in migrations, including generated
+snapshots; it does not run dataflow to infer other migration values. Other direct
+rules retain their normal generated-code policy. This is a deliberate taint scope
+exclusion, not a claim that custom migration code is safe.
+
+## Taint analysis work limit
+
+Each root method and taint rule has a default budget
+of **10,000 work units**, shared by its source/sink eligibility checks and nested
+points-to, value-content and taint analyses. Entering a dataflow graph, visiting a
+basic block, visiting an operation or comparing a delegate target spends one unit.
+This bounds repeated expansion of recursive or branching call trees without
+classifying all recursive code as unsafe or skipping every recursive method.
+
+When the limit is reached, analysis stops for that root and other methods and
+rules continue. The analyzer package emits **DNA9000**, identifying the rule,
+method and work counters. This is a coverage notice, not a security finding.
+The global tool writes an `analysis-budget` SARIF execution notification and
+marks the scan **partial**, and returns exit code **2**, including with `--fail`.
+The coverage notice is excluded from security findings and rule definitions.
+Other findings are retained in SARIF; zero findings in a partial scan is not a
+clean result. Compiler and workspace failures also return 2 and retain partial
+SARIF when requested.
+
+To retry with a larger budget, set a positive integer in `dotnetarium.json`:
+
+```json
+{
+  "Version": "2.0",
+  "MaxTaintAnalysisWork": 2000000
+}
+```
+
+Increasing the budget permits more work and can increase runtime and memory.
+This is a work limit, not a hard wall-clock or process-memory limit. Completed
+findings remain valid, but flows inside an aborted analysis may be missing.
+The default favors turnaround time. Large applications can
+produce many coverage notices; increase it when deeper coverage is required.
+
 Built-in ASP.NET Core inputs include MVC controllers, Razor Pages, Blazor binding, Minimal API lambdas or named handlers, generated gRPC service overrides, and gRPC server interceptor overrides. Minimal APIs model explicit request binding, parsable parameters, upload files, and body streams. `MapPost`, `MapPut`, and `MapPatch` also infer JSON body inputs when no visible service registration or custom binder takes precedence. Explicit service attributes and visible service registrations are excluded. Mixed `[AsParameters]` aggregates preserve separate request and service members. Registrations hidden in external DI setup require an explicit service attribute to avoid assuming an implicit body. Custom binders and implicit bodies on `MapMethods` are not inferred. For gRPC details and limits, see [gRPC taint analysis](grpc-taint.md).
 
 SignalR hub methods and client upload streams are also entry points. Their binding model excludes explicit and visible implicit service parameters; see [SignalR taint analysis](signalr-taint.md) for supported registrations and limits.

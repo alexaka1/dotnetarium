@@ -23,7 +23,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
     /// <summary>
     /// Operation visitor to flow the abstract dataflow analysis values across a given statement in a basic block.
     /// </summary>
-    public abstract class DataFlowOperationVisitor<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue> : OperationVisitor<object?, TAbstractAnalysisValue>
+    public abstract partial class DataFlowOperationVisitor<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue> : OperationVisitor<object?, TAbstractAnalysisValue>
         where TAnalysisData : AbstractAnalysisData
         where TAnalysisContext : AbstractDataFlowAnalysisContext<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue>
         where TAnalysisResult : class, IDataFlowAnalysisResult<TAbstractAnalysisValue>
@@ -2215,6 +2215,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
 
             // Bail out if configured not to execute interprocedural analysis.
             var skipInterproceduralAnalysis = !isLambdaOrLocalFunction && InterproceduralAnalysisKind == InterproceduralAnalysisKind.None ||
+                MigrationAnalysisExclusion.IsExcluded(invokedMethod) ||
                 DataFlowAnalysisContext.InterproceduralAnalysisPredicate?.SkipInterproceduralAnalysis(invokedMethod, isLambdaOrLocalFunction) == true ||
                 DataFlowAnalysisContext.AnalyzerOptions.IsConfiguredToSkipAnalysis(s_dummyDataflowAnalysisDescriptor, invokedMethod, WellKnownTypeProvider.Compilation, CancellationToken.None);
 
@@ -2292,7 +2293,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                 else
                 {
                     // Execute interprocedural analysis and get result.
-                    analysisResult = TryGetOrComputeAnalysisResult(interproceduralDataFlowAnalysisContext);
+                    analysisResult = GetOrComputeCompletedInvocation(originalOperation, interproceduralDataFlowAnalysisContext);
                     if (analysisResult == null)
                     {
                         return defaultValue;
@@ -2456,7 +2457,9 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                     getCachedAbstractValueFromCaller: GetCachedAbstractValue,
                     getInterproceduralControlFlowGraph: GetInterproceduralControlFlowGraph,
                     getAnalysisEntityForFlowCapture: GetAnalysisEntityForFlowCapture,
-                    getInterproceduralCallStackForOwningSymbol: GetInterproceduralCallStackForOwningSymbol);
+                    getInterproceduralCallStackForOwningSymbol: GetInterproceduralCallStackForOwningSymbol,
+                    cachedCallerValues: ReuseCompletedInvocations
+                        ? new Dictionary<IOperation, TAbstractAnalysisValue>() : null);
 
                 // Local functions.
                 (AnalysisEntity?, PointsToAbstractValue)? GetInvocationInstance()
@@ -2815,6 +2818,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
             _recursionDepth++;
             try
             {
+                AnalysisWorkBudget.VisitOperation();
                 StackGuard.EnsureSufficientExecutionStack(_recursionDepth);
                 return operation.Accept(this, argument!)!;
             }

@@ -14,15 +14,21 @@ namespace Dotnetarium.Analyzers.Taint
             if (sink.SourceTree == null) return null;
             var node = sink.SourceTree.GetRoot().FindNode(sink.SourceSpan);
             var model = compilation.GetSemanticModel(sink.SourceTree);
-            if (node.AncestorsAndSelf().OfType<ArgumentSyntax>().FirstOrDefault() is { } argument) return model.GetOperation(argument.Expression);
-            if (node.AncestorsAndSelf().OfType<AssignmentExpressionSyntax>().FirstOrDefault() is { } assignment) return model.GetOperation(assignment.Right);
-            return null;
+            // An object-initializer property can be inside an outer call argument.
+            // Consume the nearest boundary, not that enclosing object expression.
+            return node.AncestorsAndSelf().FirstOrDefault(candidate => candidate is ArgumentSyntax or AssignmentExpressionSyntax) switch
+            {
+                ArgumentSyntax argument => model.GetOperation(argument.Expression),
+                AssignmentExpressionSyntax assignment => model.GetOperation(assignment.Right),
+                _ => null
+            };
         }
 
-        internal static bool Guarded(Location sink, Compilation compilation, Func<IOperation, ISymbol, bool, bool> validates)
+        internal static bool Guarded(Location sink, Compilation compilation, Func<IOperation, ISymbol, bool, bool> validates,
+            ISymbol? checkedSymbol = null)
         {
             var value = Unwrap(SinkValue(sink, compilation));
-            var symbol = ReferencedSymbol(value);
+            var symbol = checkedSymbol ?? ReferencedSymbol(value);
             if (symbol is not (ILocalSymbol or IParameterSymbol) || value == null || sink.SourceTree == null) return false;
             var node = value.Syntax;
             var model = compilation.GetSemanticModel(sink.SourceTree);
@@ -62,9 +68,7 @@ namespace Dotnetarium.Analyzers.Taint
                 foreach (var syntax in owner.DescendantNodes())
                 {
                     var operation = model.GetOperation(syntax);
-                    bool writes = operation is IAssignmentOperation assignment && SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(assignment.Target)), symbol) ||
-                        operation is IArgumentOperation argument && argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out &&
-                            SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(argument.Value)), symbol);
+                    bool writes = Writes(operation, symbol);
                     if (writes && (syntax.SpanStart >= checkedAt.Span.End && syntax.SpanStart < consumedAt.Span.End ||
                         syntax.Ancestors().Any(ancestor => ancestor is LambdaExpressionSyntax or LocalFunctionStatementSyntax))) return false;
                 }
@@ -105,37 +109,221 @@ namespace Dotnetarium.Analyzers.Taint
         internal static bool HasFixedRequestAuthority(Location sink, Compilation compilation)
         {
             var operation = Unwrap(SinkValue(sink, compilation));
-            if (operation is ILocalReferenceOperation local) operation = Unwrap(StableInitializer(local.Local, compilation));
             if (operation is IObjectCreationOperation creation && creation.Type?.ToDisplayString() == "System.Uri" && creation.Arguments.Length == 1)
                 operation = Unwrap(creation.Arguments[0].Value);
-            var prefix = Prefix(operation);
-            if (prefix == null || !Uri.TryCreate(prefix, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0) return false;
-            var authorityStart = prefix.IndexOf("://", StringComparison.Ordinal);
-            return authorityStart >= 0 && prefix.IndexOf('/', authorityStart + 3) >= 0;
-
-            string? Prefix(IOperation? value)
-            {
-                value = Unwrap(value);
-                if (value?.ConstantValue.Value is string literal) return literal;
-                if (value is IBinaryOperation { OperatorKind: BinaryOperatorKind.Add, OperatorMethod: null } binary && value.Type?.SpecialType == SpecialType.System_String)
-                    return Prefix(binary.LeftOperand);
-                if (value is IInterpolatedStringOperation interpolation && interpolation.Parts.FirstOrDefault() is IInterpolatedStringTextOperation text)
-                    return text.Text.ConstantValue.Value as string;
-                return null;
-            }
+            return HasFixedHttpAuthority(ConstantStringPrefix(operation, compilation));
         }
 
-        internal static IOperation? StableInitializer(ILocalSymbol local, Compilation compilation)
+        internal static bool HasFixedRedirectDestination(Location sink, Compilation compilation)
+        {
+            var prefix = ConstantStringPrefix(SinkValue(sink, compilation), compilation);
+            // One leading slash is not enough: appending / or \\ can form an authority.
+            return prefix is { Length: >= 2 } && !prefix.Any(char.IsControl) && prefix[0] == '/' && prefix[1] is not ('/' or '\\') ||
+                HasFixedHttpAuthority(prefix);
+        }
+
+        internal static bool HasConfiguredRedirectOrigin(Location sink, Compilation compilation, Func<IOperation, bool> isTainted)
+        {
+            var value = Unwrap(SinkValue(sink, compilation));
+            if (value is ILocalReferenceOperation local) value = Unwrap(StableInitializer(local.Local, compilation));
+            while (value is IBinaryOperation { OperatorKind: BinaryOperatorKind.Add, OperatorMethod: null } concatenate &&
+                concatenate.Type?.SpecialType == SpecialType.System_String)
+            {
+                if (IsPathBoundary(concatenate.RightOperand.ConstantValue.Value as string) &&
+                    TrustedConfiguration(concatenate.LeftOperand, compilation, isTainted)) return true;
+                value = Unwrap(concatenate.LeftOperand);
+            }
+            return value is IInterpolatedStringOperation interpolation && interpolation.Parts.Length >= 2 &&
+                interpolation.Parts[0] is IInterpolationOperation origin &&
+                interpolation.Parts[1] is IInterpolatedStringTextOperation text && IsPathBoundary(text.Text.ConstantValue.Value as string) &&
+                TrustedConfiguration(origin.Expression, compilation, isTainted);
+
+            static bool IsPathBoundary(string? text) => text is { Length: >= 2 } && text[0] == '/' &&
+                text[1] is not ('/' or '\\') && !text.Any(char.IsControl);
+        }
+
+        // Configuration is a trusted origin/root contract, not a sanitizer for
+        // arbitrary strings. Preserve source models and reject local mutation.
+        private static bool TrustedConfiguration(IOperation? value, Compilation compilation, Func<IOperation, bool> isTainted)
+        {
+            var symbols = new System.Collections.Generic.HashSet<ISymbol>(SymbolEqualityComparer.Default);
+            var original = value;
+            if (!FromConfiguration(value, 0) || original == null) return false;
+            var owner = original.Syntax.Ancestors().FirstOrDefault(node => node is BaseMethodDeclarationSyntax or LambdaExpressionSyntax or LocalFunctionStatementSyntax);
+            if (owner == null) return false;
+            var model = compilation.GetSemanticModel(owner.SyntaxTree);
+            return !owner.DescendantNodes().Select(node => model.GetOperation(node)).Any(operation =>
+                symbols.Any(symbol => Writes(operation, symbol)) || operation is IInvocationOperation call && !IsSelection(call) &&
+                call.Arguments.Any(argument => argument.Value.Type?.SpecialType != SpecialType.System_String &&
+                    symbols.Any(symbol => TargetContains(argument.Value, symbol))));
+
+            bool FromConfiguration(IOperation? operation, int depth)
+            {
+                if (depth > 16) return false;
+                operation = Unwrap(operation);
+                if (operation == null || isTainted(operation)) return false;
+                switch (operation)
+                {
+                    case ILocalReferenceOperation local:
+                        symbols.Add(local.Local);
+                        return FromConfiguration(StableInitializer(local.Local, compilation), depth + 1);
+                    case IPropertyReferenceOperation property:
+                        symbols.Add(property.Property);
+                        if (property.Property.Name is "Value" or "CurrentValue" &&
+                            property.Property.ContainingType.OriginalDefinition.ToDisplayString() is
+                                "Microsoft.Extensions.Options.IOptions<TOptions>" or "Microsoft.Extensions.Options.IOptionsMonitor<TOptions>")
+                        {
+                            if (ReferencedSymbol(Unwrap(property.Instance)) is { } receiver) symbols.Add(receiver);
+                            return property.Instance != null && !isTainted(property.Instance);
+                        }
+                        if (property.Property.IsIndexer && property.Property.ContainingType.ToDisplayString() == "Microsoft.Extensions.Configuration.IConfiguration" &&
+                            property.Arguments.Length == 1 && property.Arguments[0].Value.ConstantValue.Value is string) return true;
+                        return FromConfiguration(property.Instance, depth + 1);
+                    case IInvocationOperation call when call.TargetMethod.ContainingType.SpecialType == SpecialType.System_String &&
+                        call.TargetMethod.Name == "TrimEnd" && call.Arguments.All(argument =>
+                            argument.Value.ConstantValue.Value is char character && character == '/'):
+                        return FromConfiguration(call.Instance, depth + 1);
+                    case IInvocationOperation call when IsSelection(call):
+                        return FromConfiguration(call.Instance ?? call.Arguments.FirstOrDefault()?.Value, depth + 1);
+                    default: return false;
+                }
+            }
+
+            static bool IsSelection(IInvocationOperation call) =>
+                call.TargetMethod.ContainingType.ToDisplayString() is "System.Linq.Enumerable" or "System.Linq.Queryable" &&
+                call.TargetMethod.Name is "Where" or "First" or "FirstOrDefault" or "Single" or "SingleOrDefault" or "Last" or "LastOrDefault";
+        }
+
+        internal static bool HasContainedBaseName(Location sink, Compilation compilation, Func<IOperation, bool> isTainted)
+        {
+            var value = Unwrap(SinkValue(sink, compilation));
+            if (value is ILocalReferenceOperation path) value = Unwrap(StableInitializer(path.Local, compilation));
+            if (value is not IInvocationOperation combine || combine.TargetMethod.ContainingType.ToDisplayString() != "System.IO.Path" ||
+                combine.TargetMethod.Name != "Combine" || combine.Arguments.Length != 2) return false;
+            var root = Unwrap(combine.Arguments[0].Value);
+            if (root is ILocalReferenceOperation rootLocal) root = Unwrap(StableInitializer(rootLocal.Local, compilation));
+            if (root?.ConstantValue.Value is not string && !TrustedConfiguration(root, compilation, isTainted)) return false;
+            var leaf = Unwrap(combine.Arguments[1].Value);
+            var name = ReferencedSymbol(leaf);
+            if (name is not (ILocalSymbol or IParameterSymbol)) return false;
+            var owner = leaf!.Syntax.Ancestors().FirstOrDefault(node => node is BaseMethodDeclarationSyntax or LambdaExpressionSyntax or LocalFunctionStatementSyntax);
+            if (owner == null) return false;
+            var model = compilation.GetSemanticModel(owner.SyntaxTree);
+            var writes = owner.DescendantNodes().Select(node => model.GetOperation(node)).Where(operation => Writes(operation, name)).ToArray();
+            IOperation? basename;
+            if (writes.Length == 0 && name is ILocalSymbol nameLocal) basename = StableInitializer(nameLocal, compilation);
+            else if (writes.Length == 1 && writes[0] is ISimpleAssignmentOperation assignment &&
+                assignment.Syntax.Parent is ExpressionStatementSyntax { Parent: BlockSyntax block } && block.Parent == owner &&
+                assignment.Syntax.Span.End < combine.Syntax.SpanStart) basename = assignment.Value;
+            else return false;
+            if (Unwrap(basename) is not IInvocationOperation extract || extract.TargetMethod.ContainingType.ToDisplayString() != "System.IO.Path" ||
+                extract.TargetMethod.Name != "GetFileName" || extract.Arguments.Length != 1) return false;
+
+            // GetFileName removes platform separators, but '..' still denotes
+            // the parent. A consumed ASCII alphanumeric affix excludes it.
+            return Guarded(sink, compilation, (condition, symbol, outcome) =>
+                outcome && condition is IInvocationOperation check && check.TargetMethod.ContainingType.SpecialType == SpecialType.System_String &&
+                check.TargetMethod.Name is "StartsWith" or "EndsWith" && check.Arguments.Length is 1 or 2 &&
+                check.Arguments[0].Value.ConstantValue.Value is string affix &&
+                affix.Any(character => character is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9') &&
+                SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(check.Instance)), symbol), name);
+        }
+
+        internal static bool HasValidatedFileName(Location sink, Compilation compilation)
+        {
+            var value = Unwrap(SinkValue(sink, compilation));
+            if (value is ILocalReferenceOperation path)
+                value = Unwrap(StableInitializer(path.Local, compilation));
+            // A validated leaf must not hide taint in a separately supplied root.
+            if (value is not IInvocationOperation combine || combine.TargetMethod.ContainingType.ToDisplayString() != "System.IO.Path" ||
+                combine.TargetMethod.Name != "Combine" || combine.Arguments.Length != 2) return false;
+            var root = Unwrap(combine.Arguments[0].Value);
+            if (root is ILocalReferenceOperation rootLocal) root = Unwrap(StableInitializer(rootLocal.Local, compilation));
+            if (root?.ConstantValue.Value is not string) return false;
+            var name = ReferencedSymbol(Unwrap(combine.Arguments[1].Value));
+            if (name is not (ILocalSymbol or IParameterSymbol)) return false;
+            var owner = combine.Syntax.Ancestors().FirstOrDefault(node => node is BaseMethodDeclarationSyntax or LambdaExpressionSyntax or LocalFunctionStatementSyntax);
+            if (owner == null || IsWrittenInScope(name, owner, compilation.GetSemanticModel(owner.SyntaxTree))) return false;
+
+            bool Rejects(object character) => Guarded(sink, compilation, (condition, symbol, outcome) =>
+                !outcome && condition is IInvocationOperation call && call.TargetMethod.ContainingType.SpecialType == SpecialType.System_String &&
+                call.TargetMethod.Name == "Contains" && call.Arguments.Length == 1 &&
+                Equals(call.Arguments[0].Value.ConstantValue.Value, character) &&
+                SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(call.Instance)), symbol), name);
+
+            bool invalidCharacters = Guarded(sink, compilation, (condition, symbol, outcome) =>
+                !outcome && condition is IBinaryOperation { OperatorKind: BinaryOperatorKind.GreaterThanOrEqual, OperatorMethod: null } comparison &&
+                comparison.RightOperand.ConstantValue.Value is int zero && zero == 0 &&
+                Unwrap(comparison.LeftOperand) is IInvocationOperation index && index.TargetMethod.ContainingType.SpecialType == SpecialType.System_String &&
+                index.TargetMethod.Name == "IndexOfAny" && index.Arguments.Length == 1 &&
+                SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(index.Instance)), symbol) &&
+                Unwrap(index.Arguments[0].Value) is IInvocationOperation invalid && invalid.TargetMethod.Name == "GetInvalidFileNameChars" &&
+                invalid.TargetMethod.ContainingType.ToDisplayString() == "System.IO.Path", name);
+
+            return Rejects("..") && (invalidCharacters || Rejects('/') && Rejects('\\') && Rejects(':'));
+        }
+
+        private static bool HasFixedHttpAuthority(string? prefix)
+        {
+            if (prefix == null || prefix.Any(char.IsControl) || prefix.Contains('\\') || !Uri.TryCreate(prefix, UriKind.Absolute, out var uri) ||
+                uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0) return false;
+            var authorityStart = prefix.IndexOf("://", StringComparison.Ordinal);
+            return authorityStart >= 0 && prefix.IndexOf('/', authorityStart + 3) >= 0;
+        }
+
+        private static string? ConstantStringPrefix(IOperation? value, Compilation compilation, int depth = 0)
+        {
+            if (depth > 16) return null;
+            value = Unwrap(value);
+            if (value?.ConstantValue.Value is string literal) return literal;
+            if (value is ILocalReferenceOperation local)
+                return ConstantStringPrefix(StableInitializer(local.Local, compilation, allowAppendOnly: true), compilation, depth + 1);
+            if (value is IObjectCreationOperation creation && creation.Type?.ToDisplayString() == "System.Uri" && creation.Arguments.Length == 1)
+                return ConstantStringPrefix(creation.Arguments[0].Value, compilation, depth + 1);
+            if (value is IBinaryOperation { OperatorKind: BinaryOperatorKind.Add, OperatorMethod: null } binary && value.Type?.SpecialType == SpecialType.System_String)
+                return ConstantStringPrefix(binary.LeftOperand, compilation, depth + 1);
+            if (value is IInterpolatedStringOperation interpolation && interpolation.Parts.FirstOrDefault() is IInterpolatedStringTextOperation text)
+                return text.Text.ConstantValue.Value as string;
+            return null;
+        }
+
+        internal static IOperation? StableInitializer(ILocalSymbol local, Compilation compilation, bool allowAppendOnly = false)
         {
             if (local.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax() is not VariableDeclaratorSyntax declaration || declaration.Initializer == null) return null;
             var model = compilation.GetSemanticModel(declaration.SyntaxTree);
             var owner = declaration.Ancestors().FirstOrDefault(node => node is BaseMethodDeclarationSyntax or LambdaExpressionSyntax);
-            if (owner == null || owner.DescendantNodes().Select(node => model.GetOperation(node)).Any(operation =>
-                operation is IAssignmentOperation assignment && SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(assignment.Target)), local) ||
-                operation is IArgumentOperation argument && argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out &&
-                    SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(argument.Value)), local))) return null;
+            if (owner == null || IsWrittenInScope(local, owner, model, allowAppendOnly)) return null;
             return model.GetOperation(declaration.Initializer.Value);
         }
+
+        private static bool IsWrittenInScope(ISymbol symbol, SyntaxNode owner, SemanticModel model, bool allowAppendOnly = false) =>
+            owner.DescendantNodes().Select(node => model.GetOperation(node)).Any(operation =>
+                Writes(operation, symbol) && !(allowAppendOnly && IsAppend(operation, symbol)));
+
+        private static bool IsAppend(IOperation? operation, ISymbol symbol) => operation switch
+        {
+            ICompoundAssignmentOperation { OperatorKind: BinaryOperatorKind.Add, OperatorMethod: null } append =>
+                append.Type?.SpecialType == SpecialType.System_String && TargetContains(append.Target, symbol),
+            ISimpleAssignmentOperation { Value: IBinaryOperation { OperatorKind: BinaryOperatorKind.Add, OperatorMethod: null } concatenate } assignment =>
+                concatenate.Type?.SpecialType == SpecialType.System_String && TargetContains(assignment.Target, symbol) &&
+                SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(concatenate.LeftOperand)), symbol),
+            _ => false
+        };
+
+        private static bool Writes(IOperation? operation, ISymbol symbol) => operation switch
+        {
+            IVariableDeclaratorOperation { Initializer: { } initializer } declaration when declaration.Symbol.RefKind != RefKind.None =>
+                TargetContains(initializer.Value, symbol),
+            IAssignmentOperation assignment => TargetContains(assignment.Target, symbol),
+            IIncrementOrDecrementOperation increment => TargetContains(increment.Target, symbol),
+            IArgumentOperation argument when argument.Parameter?.RefKind is RefKind.Ref or RefKind.Out =>
+                TargetContains(argument.Value, symbol),
+            _ => false
+        };
+
+        private static bool TargetContains(IOperation target, ISymbol symbol) =>
+            SymbolEqualityComparer.Default.Equals(ReferencedSymbol(Unwrap(target)), symbol) ||
+            target is ITupleOperation tuple && tuple.Elements.Any(element => TargetContains(element, symbol));
 
         internal static IOperation? Unwrap(IOperation? operation)
         { while (operation is IConversionOperation conversion) operation = conversion.Operand; return operation; }

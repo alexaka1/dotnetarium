@@ -33,6 +33,15 @@ jobs:
       - name: Scan through installed global tool
         shell: pwsh
         run: ./tests/CliSmoke/Test.ps1
+      - name: Check opt-in no-build mode through installed global tool
+        shell: pwsh
+        run: ./tests/NoBuildSmoke/Test.ps1 -ToolPackage (Get-ChildItem artifacts/*.nupkg | Where-Object Name -Match '^dotnetarium\.\d' | Select-Object -First 1).FullName
+      - name: Check identifier and boundary precision on .NET 8 and 10
+        shell: pwsh
+        run: ./tests/TaintPrecisionSmoke/Test.ps1
+      - name: Check Markdown, archive extraction and generated Razor CLI coverage
+        shell: pwsh
+        run: ./tests/MarkupArchiveSmoke/Test.ps1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dotnetarium-2-packages
@@ -49,10 +58,8 @@ jobs:
       - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: 10.0.x
-      - name: Build packages
-        run: |
-          dotnet build Dotnetarium.Analyzers/Dotnetarium.Analyzers.csproj -c Release -p:RunAnalyzers=false
-          dotnet build Dotnetarium.Tool/Dotnetarium.Tool.csproj -c Release -p:RunAnalyzers=false
+      - name: Build and run unit tests
+        run: dotnet test Dotnetarium.sln -c Release -p:RunAnalyzers=false
       - name: Pack analyzer and global tool
         run: |
           dotnet pack Dotnetarium.Analyzers/Dotnetarium.Analyzers.csproj -c Release -p:RunAnalyzers=false -o artifacts
@@ -60,3 +67,12 @@ jobs:
       - name: Scan with lowercase project config
         shell: pwsh
         run: ./tests/CliSmoke/Test.ps1
+      - name: Check opt-in no-build mode through installed global tool
+        shell: pwsh
+        run: ./tests/NoBuildSmoke/Test.ps1 -ToolPackage (Get-ChildItem artifacts/*.nupkg | Where-Object Name -Match '^dotnetarium\.\d' | Select-Object -First 1).FullName
+      - name: Check identifier and boundary precision on .NET 8 and 10
+        shell: pwsh
+        run: ./tests/TaintPrecisionSmoke/Test.ps1
+      - name: Check Markdown, archive extraction and generated Razor CLI coverage
+        shell: pwsh
+        run: ./tests/MarkupArchiveSmoke/Test.ps1

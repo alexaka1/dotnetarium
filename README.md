@@ -31,13 +31,23 @@ The global tool needs the .NET 10 runtime and an installed SDK that can load the
 ```sh
 dotnetarium MyApp.sln
 dotnetarium MyApp.sln --sarif results.sarif --fail
+dotnetarium MyApp.sln -nb --sarif exploratory.sarif
 ```
 
-The tool accepts `.csproj`, `.sln`, and `.slnx` files. `--sarif` writes SARIF 2.1.0 with relative source paths and available data-flow paths. `--fail` returns exit code 1 when there are findings, which is useful in CI. Without it, findings are printed but do not fail the command. An incomplete scan or invalid input returns exit code 2.
+The tool accepts `.csproj`, `.sln`, and `.slnx` files. `--sarif` writes SARIF 2.1.0 with relative source paths and available data-flow paths. `--fail` returns exit code 1 when there are findings, which is useful in CI. Without it, findings are printed but do not fail the command. Default-mode incomplete scans or invalid input return exit code 2.
 
 The tool selects an installed SDK using the scanned project or solution directory, including its `global.json` if present. Run `dotnetarium --help` for the complete CLI.
 
+**Experimental no-build mode:** `-nb` (or `--no-build`) reads conventional SDK projects directly and runs the same Roslyn security analysis without executing build targets, restoring packages, or running source generators. It continues through compiler errors and reports partial coverage. The default remains project-aware loading. Use `--configuration Release` or `--framework net10.0` to select inputs. See [scan modes](docs/scan-modes.md) for requirements, exit codes and analyzer-package behavior.
+
+Recursive taint analysis has a per-method work limit. A cutoff records partial coverage in SARIF and preserves other findings. Default mode returns exit code 2; `-nb` continues successfully, returning 1 only if `--fail` is set and findings are present. EF migrations and model snapshots skip taint analysis; direct hard-coded secret checks remain enabled. See [analysis scope and limits](docs/RuleConfiguration.md#ef-migration-scope).
+
 ## Configure rules
+
+Taint analysis considers remote inputs by default. To also check console input,
+process arguments and environment values, set `"ThreatModels": ["remote", "local"]`
+in `dotnetarium.json`. See [input scope](docs/RuleConfiguration.md#input-scope)
+for coverage and custom source models.
 
 Built-in models cover common .NET and provider APIs. To add a source, sink, sanitizer, or transfer, place `dotnetarium.json` beside a project. The NuGet analyzer picks it up during builds, and the global tool finds it when scanning that project. For a solution scan, a file beside the solution applies to projects without their own config. Use `--config path/to/rules.json` to override automatic discovery for a scan.
 
@@ -66,6 +76,6 @@ To move a supported C# project to 2.x, replace the `Dotnetarium.Analyzers.SCS` p
 
 ## About this repository
 
-The repository contains the analyzer, global tool, tests, and selected Roslyn flow utilities. See the [architecture notes](docs/Architecture.md) and [release instructions](docs/Releasing.md).
+The repository contains the analyzer, global tool, tests, and selected Roslyn flow utilities. See the [architecture notes](docs/Architecture.md), [scanner performance and limits](docs/scan-performance.md), and [release instructions](docs/Releasing.md).
 
 Dotnetarium 2.x is licensed under [Apache License 2.0](LICENSE). Bundled Roslyn sources retain their original licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).

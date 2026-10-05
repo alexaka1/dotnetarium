@@ -2,6 +2,7 @@
 
 using System;
 using System.Collections.Immutable;
+using System.Collections.Generic;
 using Analyzer.Utilities;
 using Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.CopyAnalysis;
 using Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.PointsToAnalysis;
@@ -36,7 +37,8 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
             Func<IOperation, TAbstractAnalysisValue> getCachedAbstractValueFromCaller,
             Func<IMethodSymbol, ControlFlowGraph?> getInterproceduralControlFlowGraph,
             Func<IOperation, AnalysisEntity?> getAnalysisEntityForFlowCapture,
-            Func<ISymbol, ImmutableStack<IOperation>?> getInterproceduralCallStackForOwningSymbol)
+            Func<ISymbol, ImmutableStack<IOperation>?> getInterproceduralCallStackForOwningSymbol,
+            Dictionary<IOperation, TAbstractAnalysisValue>? cachedCallerValues = null)
         {
             InitialAnalysisData = initialAnalysisData;
             InvocationInstance = invocationInstance;
@@ -46,9 +48,21 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
             AddressSharedEntities = addressSharedEntities;
             CallStack = callStack;
             MethodsBeingAnalyzed = methodsBeingAnalyzed;
-            GetCachedAbstractValueFromCaller = getCachedAbstractValueFromCaller;
+            CachedCallerValues = cachedCallerValues;
+            GetCachedAbstractValueFromCaller = cachedCallerValues == null ? getCachedAbstractValueFromCaller : operation =>
+            {
+                var value = getCachedAbstractValueFromCaller(operation);
+                cachedCallerValues[operation] = value;
+                return value;
+            };
             GetInterproceduralControlFlowGraph = getInterproceduralControlFlowGraph;
-            GetAnalysisEntityForFlowCapture = getAnalysisEntityForFlowCapture;
+            CachedCallerFlowCaptures = cachedCallerValues == null ? null : new Dictionary<IOperation, AnalysisEntity?>();
+            GetAnalysisEntityForFlowCapture = CachedCallerFlowCaptures == null ? getAnalysisEntityForFlowCapture : operation =>
+            {
+                var entity = getAnalysisEntityForFlowCapture(operation);
+                CachedCallerFlowCaptures[operation] = entity;
+                return entity;
+            };
             GetInterproceduralCallStackForOwningSymbol = getInterproceduralCallStackForOwningSymbol;
         }
 
@@ -61,6 +75,8 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
         public ImmutableStack<IOperation> CallStack { get; }
         public ImmutableHashSet<TAnalysisContext> MethodsBeingAnalyzed { get; }
         public Func<IOperation, TAbstractAnalysisValue> GetCachedAbstractValueFromCaller { get; }
+        internal Dictionary<IOperation, TAbstractAnalysisValue>? CachedCallerValues { get; }
+        internal Dictionary<IOperation, AnalysisEntity?>? CachedCallerFlowCaptures { get; }
         public Func<IMethodSymbol, ControlFlowGraph?> GetInterproceduralControlFlowGraph { get; }
         public Func<IOperation, AnalysisEntity?> GetAnalysisEntityForFlowCapture { get; }
         public Func<ISymbol, ImmutableStack<IOperation>?> GetInterproceduralCallStackForOwningSymbol { get; }
