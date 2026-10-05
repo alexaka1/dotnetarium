@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
 using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
@@ -39,6 +40,7 @@ internal static class Program
                 throw new FileNotFoundException("Project or solution was not found.", target);
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
+            var report = new ScanReport();
             var sdkQuery = VisualStudioInstanceQueryOptions.Default;
             sdkQuery.WorkingDirectory = root;
             var sdk = MSBuildLocator.QueryVisualStudioInstances(sdkQuery).FirstOrDefault() ??
@@ -46,12 +48,10 @@ internal static class Program
             MSBuildLocator.RegisterInstance(sdk);
 
             using var workspace = MSBuildWorkspace.Create();
-            var workspaceErrors = new List<string>();
-            bool workspaceFailure = false;
+            var workspaceErrors = new ConcurrentQueue<WorkspaceDiagnostic>();
             workspace.RegisterWorkspaceFailedHandler(diagnostic =>
             {
-                workspaceErrors.Add(diagnostic.Diagnostic.Message);
-                workspaceFailure |= diagnostic.Diagnostic.Kind == WorkspaceDiagnosticKind.Failure;
+                workspaceErrors.Enqueue(diagnostic.Diagnostic);
             });
 
             var projects = Path.GetExtension(target).ToLowerInvariant() switch
@@ -69,17 +69,23 @@ internal static class Program
                 .OrderBy(type => type.FullName, StringComparer.Ordinal)
                 .ToArray();
             var analyzers = analyzerTypes.Select(type => (DiagnosticAnalyzer)Activator.CreateInstance(type)!).ToImmutableArray();
-            var diagnostics = new List<Diagnostic>();
-            bool compilerErrors = false;
-
-            foreach (var project in projects.Where(project => project.Language == LanguageNames.CSharp))
+            var diagnostics = new ConcurrentBag<Diagnostic>();
+            // Roslyn already runs operation-block actions concurrently. Limit
+            // active projects so nested analysis does not multiply without bound.
+            var projectConcurrency = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+            // Start large projects first so one expensive compilation is not
+            // left running after the smaller projects have drained the queue.
+            await Parallel.ForEachAsync(projects.Where(project => project.Language == LanguageNames.CSharp)
+                    .OrderByDescending(project => project.DocumentIds.Count)
+                    .ThenBy(project => project.Name, StringComparer.Ordinal),
+                new ParallelOptions { MaxDegreeOfParallelism = projectConcurrency }, async (project, cancellationToken) =>
             {
                 var compilation = await project.GetCompilationAsync();
                 if (compilation == null)
                 {
-                    Console.Error.WriteLine($"Unable to compile {project.Name}.");
-                    compilerErrors = true;
-                    continue;
+                    report.Fail("compilation-load", $"Unable to compile {project.Name}.");
+                    report.SkippedProjects.Add(project.Name);
+                    return;
                 }
 
                 var additionalFiles = project.AnalyzerOptions.AdditionalFiles;
@@ -95,19 +101,26 @@ internal static class Program
                     configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, sdk.MSBuildPath);
                 var analyzerOptions = new AnalyzerOptions(additionalFiles, configOptions);
                 var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
+                report.AnalyzedProjects.Add(project.Name);
                 var projectErrors = result.Where(diagnostic =>
                     diagnostic.Id == "AD0001" ||
                     (diagnostic.Severity == DiagnosticSeverity.Error &&
                      !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal))).ToArray();
-                compilerErrors |= projectErrors.Length > 0;
-                diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal)));
-                foreach (var error in projectErrors)
-                    Console.Error.WriteLine($"{project.Name}: {error}");
-            }
+                foreach (var diagnostic in result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal) &&
+                    diagnostic.Id != AnalysisDiagnostics.WorkLimitId)) diagnostics.Add(diagnostic);
+                foreach (var notice in result.Where(diagnostic => diagnostic.Id == AnalysisDiagnostics.WorkLimitId))
+                    report.Warn("analysis-budget", $"{project.Name}: {notice}");
+                foreach (var error in projectErrors.Take(20))
+                    report.Fail(error.Id == "AD0001" ? "analyzer-failure" : "compiler-error", $"{project.Name}: {error}");
+                if (projectErrors.Length > 20)
+                    report.Fail("compiler-error-summary", $"{project.Name}: {projectErrors.Length} compiler/analyzer errors; the first 20 are shown.");
+            });
 
-            foreach (var error in workspaceErrors.Distinct(StringComparer.Ordinal))
-                Console.Error.WriteLine("Workspace: " + error);
-            compilerErrors |= workspaceFailure;
+            foreach (var error in workspaceErrors.DistinctBy(error => (error.Kind, error.Message)))
+                if (error.Kind == WorkspaceDiagnosticKind.Failure)
+                    report.Fail("workspace-error", "Workspace: " + error.Message);
+                else
+                    report.Warn("workspace-warning", "Workspace: " + error.Message);
 
             var findings = diagnostics
                 .GroupBy(diagnostic => new
@@ -121,6 +134,7 @@ internal static class Program
                 .OrderBy(diagnostic => diagnostic.Location.SourceTree?.FilePath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(diagnostic => diagnostic.Location.SourceSpan.Start)
                 .ThenBy(diagnostic => diagnostic.Id, StringComparer.Ordinal)
+                .ThenBy(diagnostic => diagnostic.GetMessage(), StringComparer.Ordinal)
                 .ToArray();
 
             foreach (var diagnostic in findings)
@@ -134,14 +148,16 @@ internal static class Program
                 Console.WriteLine($"{path}({line.StartLinePosition.Line + 1},{line.StartLinePosition.Character + 1}): {diagnostic.Id}{cwe}: {diagnostic.GetMessage()}");
             }
 
-            Console.WriteLine($"{findings.Length} security finding(s){(compilerErrors ? " (partial scan)" : string.Empty)}.");
-            if (compilerErrors)
+            foreach (var notice in report.Notices.Distinct().OrderBy(notice => notice.Id, StringComparer.Ordinal).ThenBy(notice => notice.Message, StringComparer.Ordinal))
+                Console.Error.WriteLine($"{(notice.IsFailure ? "Error" : "Coverage")}: {notice.Message}");
+            Console.WriteLine($"{findings.Length} security finding(s){(report.IsPartial ? " (partial scan)" : string.Empty)}; {report.AnalyzedProjects.Count} project compilation(s) analyzed.");
+            if (options.SarifPath != null)
+                await SarifWriter.WriteAsync(options.SarifPath, target, findings, report);
+            if (report.HasIncompleteAnalysis)
             {
-                Console.Error.WriteLine("Scan incomplete: project or workspace errors occurred.");
+                Console.Error.WriteLine("Scan incomplete: project/workspace errors or taint work limits occurred; see coverage notices.");
                 return 2;
             }
-            if (options.SarifPath != null)
-                await SarifWriter.WriteAsync(options.SarifPath, target, findings);
             return options.Fail && findings.Length > 0 ? 1 : 0;
         }
         catch (System.Text.Json.JsonException error)

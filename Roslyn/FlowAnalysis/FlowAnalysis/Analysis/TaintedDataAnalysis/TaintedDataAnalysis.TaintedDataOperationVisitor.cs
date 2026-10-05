@@ -25,7 +25,6 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
         private sealed class TaintedDataOperationVisitor : AnalysisEntityDataFlowOperationVisitor<TaintedDataAnalysisData, TaintedDataAnalysisContext, TaintedDataAnalysisResult, TaintedDataAbstractValue>
         {
             private readonly TaintedDataAnalysisDomain _taintedDataAnalysisDomain;
-            private readonly Dictionary<IMethodSymbol, ImmutableArray<IMethodSymbol>> _interfaceTargets = new Dictionary<IMethodSymbol, ImmutableArray<IMethodSymbol>>();
             private BufferAliasAnalysis? _bufferAliases;
 
             /// <summary>
@@ -608,46 +607,8 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
                 // For a receiver supplied outside this method (for example, constructor
                 // injection), the implementation is unknown. Analyze every implementation
                 // visible in this compilation as a possible target.
-                if (_interfaceTargets.TryGetValue(method, out var cachedTargets))
-                {
-                    return cachedTargets;
-                }
-
-                var builder = ImmutableArray.CreateBuilder<IMethodSymbol>();
-                AddImplementations(WellKnownTypeProvider.Compilation.GlobalNamespace);
-                var possibleTargets = builder.Distinct().ToImmutableArray();
-                _interfaceTargets.Add(method, possibleTargets);
-                return possibleTargets;
-
-                void AddImplementations(INamespaceSymbol namespaceSymbol)
-                {
-                    foreach (var type in namespaceSymbol.GetTypeMembers())
-                    {
-                        AddTypeImplementations(type);
-                    }
-
-                    foreach (var child in namespaceSymbol.GetNamespaceMembers())
-                    {
-                        AddImplementations(child);
-                    }
-                }
-
-                void AddTypeImplementations(INamedTypeSymbol type)
-                {
-                    if (!type.IsAbstract && type.AllInterfaces.Contains(method.ContainingType))
-                    {
-                        if (type.FindImplementationForInterfaceMember(method) is IMethodSymbol target &&
-                            target.Locations.Any(location => location.IsInSource))
-                        {
-                            builder.Add(target);
-                        }
-                    }
-
-                    foreach (var nestedType in type.GetTypeMembers())
-                    {
-                        AddTypeImplementations(nestedType);
-                    }
-                }
+                return SourceInterfaceImplementationMap.GetOrCreate(WellKnownTypeProvider.Compilation)
+                    .GetTargets(method, SourceInterfaceImplementationMap.GetReceiverType(instance, DataFlowAnalysisContext.ControlFlowGraph));
             }
 
             private bool IsConstructorInjectedField(IOperation instance, INamedTypeSymbol serviceType)

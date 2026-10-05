@@ -37,6 +37,8 @@ The tool accepts `.csproj`, `.sln`, and `.slnx` files. `--sarif` writes SARIF 2.
 
 The tool selects an installed SDK using the scanned project or solution directory, including its `global.json` if present. Run `dotnetarium --help` for the complete CLI.
 
+Recursive taint analysis has a per-method work limit. A cutoff returns exit code 2 and records partial coverage in SARIF, preserving other findings. EF migrations and model snapshots skip taint analysis; direct hard-coded secret checks remain enabled. See [analysis scope and limits](docs/RuleConfiguration.md#ef-migration-scope).
+
 ## Configure rules
 
 Built-in models cover common .NET and provider APIs. To add a source, sink, sanitizer, or transfer, place `dotnetarium.json` beside a project. The NuGet analyzer picks it up during builds, and the global tool finds it when scanning that project. For a solution scan, a file beside the solution applies to projects without their own config. Use `--config path/to/rules.json` to override automatic discovery for a scan.
@@ -66,6 +68,6 @@ To move a supported C# project to 2.x, replace the `Dotnetarium.Analyzers.SCS` p
 
 ## About this repository
 
-The repository contains the analyzer, global tool, tests, and selected Roslyn flow utilities. See the [architecture notes](docs/Architecture.md) and [release instructions](docs/Releasing.md).
+The repository contains the analyzer, global tool, tests, and selected Roslyn flow utilities. See the [architecture notes](docs/Architecture.md), [scanner performance and limits](docs/scan-performance.md), and [release instructions](docs/Releasing.md).
 
 Dotnetarium 2.x is licensed under [Apache License 2.0](LICENSE). Bundled Roslyn sources retain their original licenses; see [third-party notices](THIRD_PARTY_NOTICES.md).

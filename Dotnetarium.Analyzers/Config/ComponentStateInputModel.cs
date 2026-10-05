@@ -34,6 +34,7 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var syntax in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (InvocationSyntax.Name(syntax.Expression) is not ("AddAttribute" or "AddComponentParameter")) continue;
                     if (model.GetOperation(syntax) is not IInvocationOperation attribute || attribute.TargetMethod.Name is not ("AddAttribute" or "AddComponentParameter") ||
                         attribute.TargetMethod.ContainingType.ToDisplayString() != "Microsoft.AspNetCore.Components.Rendering.RenderTreeBuilder" ||
                         attribute.Arguments.Length < 3 || attribute.Arguments[1].Value.ConstantValue.Value is not string name ||
@@ -66,6 +67,7 @@ namespace Dotnetarium.Config
             var frames = new Stack<INamedTypeSymbol?>();
             foreach (var syntax in block.DescendantNodes().OfType<InvocationExpressionSyntax>().Where(node => node.SpanStart < attribute.Syntax.SpanStart))
             {
+                if (InvocationSyntax.Name(syntax.Expression) is not ("OpenElement" or "OpenComponent" or "CloseElement" or "CloseComponent")) continue;
                 if (model.GetOperation(syntax) is not IInvocationOperation call ||
                     call.TargetMethod.ContainingType.ToDisplayString() != "Microsoft.AspNetCore.Components.Rendering.RenderTreeBuilder") continue;
                 if (call.TargetMethod.Name == "OpenElement") frames.Push(null);

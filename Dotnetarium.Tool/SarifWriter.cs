@@ -8,7 +8,8 @@ internal static class SarifWriter
 {
     private const string SourceRootId = "%SRCROOT%";
 
-    internal static async Task WriteAsync(string output, string target, IReadOnlyList<Diagnostic> diagnostics)
+    internal static async Task WriteAsync(string output, string target, IReadOnlyList<Diagnostic> diagnostics,
+        ScanReport? report = null)
     {
         var root = Path.GetDirectoryName(Path.GetFullPath(target))!;
         var descriptors = diagnostics.Select(diagnostic => diagnostic.Descriptor)
@@ -32,6 +33,7 @@ internal static class SarifWriter
         json.WriteStartObject();
         WriteTool(json, descriptors);
         WriteSourceRoot(json, root);
+        if (report != null) WriteInvocation(json, report);
         json.WriteStartArray("results");
         foreach (var diagnostic in diagnostics)
             WriteResult(json, diagnostic, root, ruleIndexes[diagnostic.Id]);
@@ -40,6 +42,37 @@ internal static class SarifWriter
         json.WriteEndArray();
         json.WriteEndObject();
         await json.FlushAsync();
+    }
+
+    private static void WriteInvocation(Utf8JsonWriter json, ScanReport report)
+    {
+        json.WriteStartArray("invocations");
+        json.WriteStartObject();
+        json.WriteBoolean("executionSuccessful", !report.HasIncompleteAnalysis);
+        json.WriteStartObject("properties");
+        json.WriteString("dotnetarium.loadingMode", "project");
+        json.WriteString("dotnetarium.coverage", report.IsPartial ? "partial" : "complete");
+        json.WriteStartArray("dotnetarium.analyzedProjects");
+        foreach (var project in report.AnalyzedProjects.Order(StringComparer.Ordinal)) json.WriteStringValue(project);
+        json.WriteEndArray();
+        json.WriteStartArray("dotnetarium.skippedProjects");
+        foreach (var project in report.SkippedProjects.Distinct().Order(StringComparer.Ordinal)) json.WriteStringValue(project);
+        json.WriteEndArray();
+        json.WriteEndObject();
+        json.WriteStartArray("toolExecutionNotifications");
+        foreach (var notice in report.Notices.Distinct().OrderBy(notice => notice.Id, StringComparer.Ordinal).ThenBy(notice => notice.Message, StringComparer.Ordinal))
+        {
+            json.WriteStartObject();
+            json.WriteStartObject("descriptor");
+            json.WriteString("id", notice.Id);
+            json.WriteEndObject();
+            json.WriteString("level", notice.IsFailure ? "error" : "warning");
+            WriteMessage(json, "message", notice.Message);
+            json.WriteEndObject();
+        }
+        json.WriteEndArray();
+        json.WriteEndObject();
+        json.WriteEndArray();
     }
 
     private static void WriteTool(Utf8JsonWriter json, IEnumerable<DiagnosticDescriptor> descriptors)

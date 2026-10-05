@@ -33,12 +33,14 @@ namespace Dotnetarium.Config
             MaxInterproceduralLambdaOrLocalFunctionCallChain =
                 data.MaxInterproceduralLambdaOrLocalFunctionCallChain ?? 5;
             TaintFlowVisualizationEnabled = data.TaintFlowVisualizationEnabled ?? true;
+            MaxTaintAnalysisWork = data.MaxTaintAnalysisWork ?? 10000;
             TaintConfiguration = new TaintConfiguration(data, compilation, options);
         }
 
         public uint MaxInterproceduralMethodCallChain { get; }
         public uint MaxInterproceduralLambdaOrLocalFunctionCallChain { get; }
         public bool TaintFlowVisualizationEnabled { get; }
+        public uint MaxTaintAnalysisWork { get; }
         public TaintConfiguration TaintConfiguration { get; }
     }
 
@@ -56,6 +58,8 @@ namespace Dotnetarium.Config
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SourceInfo>> sourceMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SanitizerInfo>> sanitizerMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SinkInfo>> sinkMaps = new();
+        private readonly ConcurrentDictionary<SinkKind, SinkReachability> sinkReachability = new();
+        private readonly ConcurrentDictionary<SinkKind, SourceReachability> sourceReachability = new();
 
         public TaintConfiguration(ConfigData model, Compilation compilation, AnalyzerOptions options)
         {
@@ -78,6 +82,12 @@ namespace Dotnetarium.Config
 
         public TaintedDataSymbolMap<SinkInfo> GetSinkSymbolMap(SinkKind kind) =>
             sinkMaps.GetOrAdd(kind, current => new TaintedDataSymbolMap<SinkInfo>(types, CompileSinks(current)));
+
+        internal SinkReachability GetSinkReachability(SinkKind kind) =>
+            sinkReachability.GetOrAdd(kind, current => new SinkReachability(compilation, GetSinkSymbolMap(current)));
+
+        internal SourceReachability GetSourceReachability(SinkKind kind) =>
+            sourceReachability.GetOrAdd(kind, current => new SourceReachability(compilation, GetSourceSymbolMap(current)));
 
         private static bool Applies(HashSet<TaintType> contexts, SinkKind kind) =>
             contexts == null || contexts.Any(context => (int)context == (int)kind);
@@ -376,9 +386,10 @@ namespace Dotnetarium.Config
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             var isLambdaHandler = argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
                 argument == invocation.ArgumentList.Arguments.LastOrDefault() &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 IsMinimalApiMapMethod(compilation.GetSemanticModel(invocation.SyntaxTree)
                     .GetSymbolInfo(invocation).Symbol as IMethodSymbol);
-            var isNamedHandler = parameter.ContainingSymbol is IMethodSymbol owner &&
+            var isNamedHandler = parameter.ContainingSymbol is IMethodSymbol { MethodKind: not MethodKind.AnonymousFunction } owner &&
                 minimalApiHandlers.Value.ContainsKey(owner);
             return isLambdaHandler || isNamedHandler;
         }
@@ -389,6 +400,7 @@ namespace Dotnetarium.Config
             var lambda = syntax?.AncestorsAndSelf().OfType<LambdaExpressionSyntax>().FirstOrDefault();
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             if (argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 compilation.GetSemanticModel(invocation.SyntaxTree).GetSymbolInfo(invocation).Symbol is IMethodSymbol map)
                 return SupportsInferredBody(map);
             return parameter.ContainingSymbol is IMethodSymbol owner &&
@@ -443,8 +455,10 @@ namespace Dotnetarium.Config
         {
             var direct = MessageInputModel.StableParameter(instance, compilation);
             var parameters = direct != null ? new[] { direct } : endpointFilters.Value.GetBoundParameters(instance);
-            var values = parameters.Where(parameter => !HasServiceBindingAttribute(parameter) && IsMinimalApiHandlerParameter(parameter) &&
-                    parameter.Type is INamedTypeSymbol bound && HasCustomRequestBinder(bound))
+            // Ordinary DTO properties cannot be custom-binder inputs. Check
+            // their type before triggering compilation-wide handler discovery.
+            var values = parameters.Where(parameter => parameter.Type is INamedTypeSymbol bound && HasCustomRequestBinder(bound) &&
+                    !HasServiceBindingAttribute(parameter) && IsMinimalApiHandlerParameter(parameter))
                 .Select(parameter => binderInputs.GetMemberInput((INamedTypeSymbol)parameter.Type, member, kind))
                 .Where(value => value != null).ToArray();
             return values.Length == 0 ? null : TaintedDataAbstractValue.MergeTainted(values!);
@@ -508,6 +522,10 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var invocation in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (!IsMinimalApiMapSyntax(invocation.Expression)) continue;
+                    // Lambda handlers are checked at their parameter syntax;
+                    // only method groups can populate this named-handler map.
+                    if (invocation.ArgumentList.Arguments.LastOrDefault()?.Expression is AnonymousFunctionExpressionSyntax) continue;
                     var map = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
                     if (!IsMinimalApiMapMethod(map) ||
                         invocation.ArgumentList.Arguments.LastOrDefault() is not { } handlerArgument)
@@ -524,9 +542,15 @@ namespace Dotnetarium.Config
             return handlers.ToImmutable();
         }
 
+        private static bool IsMinimalApiMapSyntax(ExpressionSyntax expression) =>
+            IsMinimalApiMapName(InvocationSyntax.Name(expression));
+
         private static bool IsMinimalApiMapMethod(IMethodSymbol? method) =>
             method != null && method.ContainingNamespace.ToDisplayString() == "Microsoft.AspNetCore.Builder" &&
-            method.Name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
+            IsMinimalApiMapName(method.Name);
+
+        private static bool IsMinimalApiMapName(string? name) =>
+            name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
                 "MapPatch" or "MapMethods" or "MapFallback";
 
         private static bool HasAnyTypeAttribute(

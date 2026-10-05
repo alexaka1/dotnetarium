@@ -11,6 +11,7 @@ namespace Dotnetarium.Config
         public string Version { get; set; }
         public uint? MaxInterproceduralMethodCallChain { get; set; }
         public uint? MaxInterproceduralLambdaOrLocalFunctionCallChain { get; set; }
+        public uint? MaxTaintAnalysisWork { get; set; }
         public bool? TaintFlowVisualizationEnabled { get; set; }
         public Dictionary<string, TaintEntryPointData> TaintEntryPoints { get; set; }
         public List<TaintSource> TaintSources { get; set; }
