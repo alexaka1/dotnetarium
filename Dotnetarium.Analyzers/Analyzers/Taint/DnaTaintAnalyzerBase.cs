@@ -68,14 +68,14 @@ namespace Dotnetarium.Analyzers.Taint
                     block.CancellationToken))
                 return;
 
-            if (!ContainsPotentialSource(block.OperationBlocks, sources, block.Compilation))
-                return;
-
             var graph = block.OperationBlocks.GetControlFlowGraph();
             if (graph == null)
                 return;
 
             if (!settings.TaintConfiguration.GetSinkReachability(kind).MayReachSink(graph, block.CancellationToken))
+                return;
+
+            if (!settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(graph, block.CancellationToken))
                 return;
 
             AnalyzeGraph(graph, block.OwningSymbol);

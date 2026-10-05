@@ -644,6 +644,62 @@ total or full-scan parity claim for LANCommander. Further work needs a bounded
 recursive summary/widening design with explicit coverage tradeoffs, rather than
 silently reducing call depth or treating an interrupted scan as clean.
 
+### Origin eligibility and callback bodies
+
+`System.Object` in the source configuration is an entry-point lookup container,
+not a declaration that every object or string parameter is untrusted. The model
+predicates restrict origins to MVC/minimal API, gRPC, SignalR, messaging, Azure
+Functions and relevant component bindings. Removing the container would remove
+valid framework coverage. The old invocation precheck nevertheless treated the
+presence of *any* source-info record on a containing type as an origin. Because
+ordinary classes inherit `System.Object`, unrelated calls passed that precheck.
+Transfer-only model records caused the same unnecessary eligibility.
+
+The new bounded source-reachability proof distinguishes actual method/field/property
+origins and modeled entry parameters from transfer operations. It follows source
+helpers, constructors, accessors, operators, interface candidates, nested local
+functions and callbacks. A source-free recursive closure can be skipped; a
+recursive helper carrying a modeled origin remains eligible at the existing
+method/local-function depth of five. This is not a blanket recursion cutoff.
+
+Unknown delegates are checked against an overapproximation of engine-visible
+source methods, lambdas and bound metadata method groups compatible with their
+signature. Generic inference, variance, optional/params and ref adaptations retain
+possibly compatible candidates. Detached lambda operations use an executable
+ancestor CFG, retaining captured origins and potentially unrelated sibling code.
+The proof has a 2,048-method and 64-nested-CFG budget; dynamic/invalid operations,
+unresolved callable CFGs and budget exhaustion retain normal analysis. Negative
+method summaries are published only after the entire closure is checked.
+
+External metadata, native methods and unavailable ordinary bodies keep the engine's
+existing model-only boundary. Explicit source-method and entry-parameter models
+are checked before applying that boundary. Referenced source-project bodies that
+`GetTopmostOperationBlock` cannot enter are treated the same way. This is an
+absence-of-*modeled-engine-origin* proof, not a claim that external code is trusted
+or that it cannot read attacker input. Cross-project body propagation and arbitrary
+runtime delegate targets remain existing engine limitations.
+
+**Tradeoffs:** the callable index and CFG summaries add compilation-scoped memory
+and semantic-model work. Broad delegate signatures and unknown generic types can
+still expand large proof closures or preserve unnecessary analysis. A recursive
+method with genuine source-to-sink work can still be expensive; this change does
+not provide a general widening/recursive-summary algorithm. Source models must be
+complete for the coverage promised by the scanner.
+
+The first comparison application, HelveticOps (25 source files across four net8.0
+projects), completed its direct scan in 5.26 seconds, but had compilation gaps and
+is not a full-coverage benchmark. eShopOnWeb PublicApi's workspace scan completed in
+12.77 seconds across four projects/133 source files, without compiler-error notices;
+two NuGet-audit workspace notices still marked its report partial. Its direct
+scan completed in 10.85 seconds with transitive-reference compilation gaps.
+Dotnetarium.Tool's own direct scan completed in 21.83 seconds with omitted project
+inputs/references, so that result is likewise not a complete self-audit.
+
+The current implementation passes 683 unit tests, including source-free recursion,
+recursive origins, helper/getter/constructor/interface sources, captured callbacks,
+metadata method groups, generic return inference, unavailable/native body models
+and proof-budget fallback. SharpSaster preserves all 41 complete findings and flows.
+
 ## Next experiment and promotion gates
 
 1. **Complete:** compilation-input inventory and comparison, including resolved
