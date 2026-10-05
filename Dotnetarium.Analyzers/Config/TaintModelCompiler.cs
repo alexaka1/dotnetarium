@@ -33,7 +33,7 @@ namespace Dotnetarium.Config
             MaxInterproceduralLambdaOrLocalFunctionCallChain =
                 data.MaxInterproceduralLambdaOrLocalFunctionCallChain ?? 5;
             TaintFlowVisualizationEnabled = data.TaintFlowVisualizationEnabled ?? true;
-            MaxTaintAnalysisWork = data.MaxTaintAnalysisWork ?? 250000;
+            MaxTaintAnalysisWork = data.MaxTaintAnalysisWork ?? 5000;
             TaintConfiguration = new TaintConfiguration(data, compilation, options);
         }
 
@@ -386,6 +386,7 @@ namespace Dotnetarium.Config
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             var isLambdaHandler = argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
                 argument == invocation.ArgumentList.Arguments.LastOrDefault() &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 IsMinimalApiMapMethod(compilation.GetSemanticModel(invocation.SyntaxTree)
                     .GetSymbolInfo(invocation).Symbol as IMethodSymbol);
             var isNamedHandler = parameter.ContainingSymbol is IMethodSymbol owner &&
@@ -399,6 +400,7 @@ namespace Dotnetarium.Config
             var lambda = syntax?.AncestorsAndSelf().OfType<LambdaExpressionSyntax>().FirstOrDefault();
             var argument = lambda?.Ancestors().OfType<ArgumentSyntax>().FirstOrDefault();
             if (argument?.Parent?.Parent is InvocationExpressionSyntax invocation &&
+                IsMinimalApiMapSyntax(invocation.Expression) &&
                 compilation.GetSemanticModel(invocation.SyntaxTree).GetSymbolInfo(invocation).Symbol is IMethodSymbol map)
                 return SupportsInferredBody(map);
             return parameter.ContainingSymbol is IMethodSymbol owner &&
@@ -518,6 +520,7 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var invocation in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (!IsMinimalApiMapSyntax(invocation.Expression)) continue;
                     var map = model.GetSymbolInfo(invocation).Symbol as IMethodSymbol;
                     if (!IsMinimalApiMapMethod(map) ||
                         invocation.ArgumentList.Arguments.LastOrDefault() is not { } handlerArgument)
@@ -534,9 +537,15 @@ namespace Dotnetarium.Config
             return handlers.ToImmutable();
         }
 
+        private static bool IsMinimalApiMapSyntax(ExpressionSyntax expression) =>
+            IsMinimalApiMapName(InvocationSyntax.Name(expression));
+
         private static bool IsMinimalApiMapMethod(IMethodSymbol? method) =>
             method != null && method.ContainingNamespace.ToDisplayString() == "Microsoft.AspNetCore.Builder" &&
-            method.Name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
+            IsMinimalApiMapName(method.Name);
+
+        private static bool IsMinimalApiMapName(string? name) =>
+            name is "Map" or "MapGet" or "MapPost" or "MapPut" or "MapDelete" or
                 "MapPatch" or "MapMethods" or "MapFallback";
 
         private static bool HasAnyTypeAttribute(

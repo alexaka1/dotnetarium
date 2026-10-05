@@ -53,14 +53,14 @@ internal static class SarifWriter
         json.WriteString("dotnetarium.loadingMode", loadingMode);
         json.WriteString("dotnetarium.coverage", report.IsPartial ? "partial" : "complete");
         json.WriteStartArray("dotnetarium.analyzedProjects");
-        foreach (var project in report.AnalyzedProjects) json.WriteStringValue(project);
+        foreach (var project in report.AnalyzedProjects.Order(StringComparer.Ordinal)) json.WriteStringValue(project);
         json.WriteEndArray();
         json.WriteStartArray("dotnetarium.skippedProjects");
-        foreach (var project in report.SkippedProjects.Distinct()) json.WriteStringValue(project);
+        foreach (var project in report.SkippedProjects.Distinct().Order(StringComparer.Ordinal)) json.WriteStringValue(project);
         json.WriteEndArray();
         json.WriteEndObject();
         json.WriteStartArray("toolExecutionNotifications");
-        foreach (var notice in report.Notices.Distinct())
+        foreach (var notice in report.Notices.Distinct().OrderBy(notice => notice.Id, StringComparer.Ordinal).ThenBy(notice => notice.Message, StringComparer.Ordinal))
         {
             json.WriteStartObject();
             json.WriteStartObject("descriptor");

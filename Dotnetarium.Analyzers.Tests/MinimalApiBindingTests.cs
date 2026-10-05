@@ -58,6 +58,28 @@ public sealed class MinimalApiBindingTests
         await AssertFindings("app.MapPost(\"/bound\", (BoundInput input) => Process.Start(input.Value));", "", 0);
     }
 
+    [Theory]
+    [InlineData("app.MapGet(\"/go\", Redirect);", 1)]
+    [InlineData("EndpointRouteBuilderExtensions.MapGet(app, \"/go\", Redirect);", 1)]
+    [InlineData("Routes.MapGet(app, \"/go\", Redirect);", 1)]
+    [InlineData("app?.MapGet(\"/go\", Redirect);", 1)]
+    [InlineData("Fake.MapGet(\"/go\", Redirect);", 0)]
+    public async Task Named_handler_discovery_preserves_call_forms_and_rejects_unrelated_map_methods(string mapping, int expected)
+    {
+        var diagnostics = await FrameworkProbe.Analyze($$"""
+            using System;
+            using Microsoft.AspNetCore.Builder;
+            using Microsoft.AspNetCore.Http;
+            using Routes = Microsoft.AspNetCore.Builder.EndpointRouteBuilderExtensions;
+            public static class Fake { public static void MapGet(string route, Func<string, IResult> handler) {} }
+            public static class Endpoints {
+                public static void Configure(WebApplication app) { {{mapping}} }
+                public static IResult Redirect(string url) => Results.Redirect(url);
+            }
+            """, new OpenRedirectTaintAnalyzer());
+        Assert.Equal(expected, diagnostics.Count(diagnostic => diagnostic.Id == "DNA0005"));
+    }
+
     private static async Task AssertFindings(string mapping, string registration, int expected)
     {
         var source = """

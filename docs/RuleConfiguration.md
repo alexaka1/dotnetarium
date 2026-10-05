@@ -46,9 +46,10 @@ Configuration cannot express arbitrary code flow or whole-application dependency
 
 ## Taint analysis work limit
 
-Each root method and taint rule has a default budget of **250,000 work units**,
-shared by its nested points-to, value-content and taint analyses. Entering a
-dataflow graph, visiting a basic block or visiting an operation spends one unit.
+On the experimental branch, each root method and taint rule has a default budget
+of **5,000 work units**, shared by its source/sink eligibility checks and nested
+points-to, value-content and taint analyses. Entering a dataflow graph, visiting a
+basic block, visiting an operation or comparing a delegate target spends one unit.
 This bounds repeated expansion of recursive or branching call trees without
 classifying all recursive code as unsafe or skipping every recursive method.
 
@@ -71,6 +72,8 @@ To retry with a larger budget, set a positive integer in `dotnetarium.json`:
 Increasing the budget permits more work and can increase runtime and memory.
 This is a work limit, not a hard wall-clock or process-memory limit. Completed
 findings remain valid, but flows inside an aborted analysis may be missing.
+The small experimental default favors turnaround time. Large applications can
+produce many coverage notices; increase it when deeper coverage is required.
 
 Built-in ASP.NET Core inputs include MVC controllers, Razor Pages, Blazor binding, Minimal API lambdas or named handlers, generated gRPC service overrides, and gRPC server interceptor overrides. Minimal APIs model explicit request binding, parsable parameters, upload files, and body streams. `MapPost`, `MapPut`, and `MapPatch` also infer JSON body inputs when no visible service registration or custom binder takes precedence. Explicit service attributes and visible service registrations are excluded. Mixed `[AsParameters]` aggregates preserve separate request and service members. Registrations hidden in external DI setup require an explicit service attribute to avoid assuming an implicit body. Custom binders and implicit bodies on `MapMethods` are not inferred. For gRPC details and limits, see [gRPC taint analysis](grpc-taint.md).
 

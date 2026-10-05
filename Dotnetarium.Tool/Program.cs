@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Collections.Concurrent;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
@@ -51,8 +52,12 @@ internal static class Program
                 .OrderBy(type => type.FullName, StringComparer.Ordinal)
                 .ToArray();
             var analyzers = analyzerTypes.Select(type => (DiagnosticAnalyzer)Activator.CreateInstance(type)!).ToImmutableArray();
-            var diagnostics = new List<Diagnostic>();
-            foreach (var project in inputs.Projects)
+            var diagnostics = new ConcurrentBag<Diagnostic>();
+            // Each Roslyn driver already analyzes methods concurrently. Bound the
+            // number of project compilations to avoid multiplying that work without limit.
+            var projectConcurrency = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+            await Parallel.ForEachAsync(inputs.Projects,
+                new ParallelOptions { MaxDegreeOfParallelism = projectConcurrency }, async (project, cancellationToken) =>
             {
                 Compilation? compilation;
                 try { compilation = await project.GetCompilationAsync(); }
@@ -60,21 +65,21 @@ internal static class Program
                 {
                     report.Warn("compilation-load", $"{project.Name}: {error.Message}");
                     report.SkippedProjects.Add(project.Name);
-                    continue;
+                    return;
                 }
                 if (compilation == null || !compilation.SyntaxTrees.Any())
                 {
                     if (inventory != null && compilation != null) await inventory.CaptureAsync(project, compilation, project.AnalyzerOptions, inputs);
                     report.Warn("compilation-load", $"{project.Name}: no usable source compilation.");
                     report.SkippedProjects.Add(project.Name);
-                    continue;
+                    return;
                 }
                 if (compilation.GetSpecialType(SpecialType.System_Object).TypeKind == TypeKind.Error)
                 {
                     if (inventory != null) await inventory.CaptureAsync(project, compilation, project.AnalyzerOptions, inputs);
                     report.Warn("compilation-load", $"{project.Name}: core framework symbols are unavailable; no usable semantic analysis.");
                     report.SkippedProjects.Add(project.Name);
-                    continue;
+                    return;
                 }
 
                 var additionalFiles = project.AnalyzerOptions.AdditionalFiles;
@@ -106,23 +111,24 @@ internal static class Program
                 {
                     var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
                     report.AnalyzedProjects.Add(project.Name);
-                    diagnostics.AddRange(result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal) &&
-                        diagnostic.Id != AnalysisDiagnostics.WorkLimitId));
+                    foreach (var diagnostic in result.Where(diagnostic => diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal) &&
+                        diagnostic.Id != AnalysisDiagnostics.WorkLimitId)) diagnostics.Add(diagnostic);
                     foreach (var notice in result.Where(diagnostic => diagnostic.Id == AnalysisDiagnostics.WorkLimitId))
                         report.Warn("analysis-budget", $"{project.Name}: {notice}");
-                    foreach (var error in result.Where(diagnostic => diagnostic.Id == "AD0001" ||
-                        (diagnostic.Severity == DiagnosticSeverity.Error && !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal))))
-                    {
-                        if (error.Id == "AD0001") report.Fail("analyzer-failure", $"{project.Name}: {error}");
-                        else report.Warn("compiler-error", $"{project.Name}: {error}");
-                    }
+                    foreach (var error in result.Where(diagnostic => diagnostic.Id == "AD0001"))
+                        report.Fail("analyzer-failure", $"{project.Name}: {error}");
+                    var compilerErrors = result.Where(diagnostic => diagnostic.Severity == DiagnosticSeverity.Error &&
+                        diagnostic.Id != "AD0001" && !diagnostic.Id.StartsWith("DNA", StringComparison.Ordinal)).ToArray();
+                    foreach (var error in compilerErrors.Take(20)) report.Warn("compiler-error", $"{project.Name}: {error}");
+                    if (compilerErrors.Length > 20)
+                        report.Warn("compiler-error-summary", $"{project.Name}: {compilerErrors.Length} compiler errors; the first 20 are shown. Semantic coverage is incomplete.");
                 }
                 catch (Exception error) when (error is not OperationCanceledException)
                 {
                     report.Fail("analysis-failure", $"{project.Name}: {error.Message}");
                     report.SkippedProjects.Add(project.Name);
                 }
-            }
+            });
             if (report.AnalyzedProjects.Count == 0) report.Fail("no-analysis", "No usable C# projects were analyzed.");
 
             var findings = diagnostics

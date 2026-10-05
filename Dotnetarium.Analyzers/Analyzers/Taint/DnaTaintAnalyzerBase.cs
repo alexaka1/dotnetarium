@@ -72,15 +72,13 @@ namespace Dotnetarium.Analyzers.Taint
             if (graph == null)
                 return;
 
-            if (!settings.TaintConfiguration.GetSinkReachability(kind).MayReachSink(graph, block.CancellationToken))
-                return;
-
-            if (!settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(graph, block.CancellationToken))
-                return;
-
             using var budget = new AnalysisWorkBudget(settings.MaxTaintAnalysisWork, block.CancellationToken);
             try
             {
+                if (!settings.TaintConfiguration.GetSinkReachability(kind).MayReachSink(graph, block.CancellationToken))
+                    return;
+                if (!settings.TaintConfiguration.GetSourceReachability(kind).MayReachSource(graph, block.CancellationToken))
+                    return;
                 AnalyzeGraph(graph, block.OwningSymbol);
             }
             catch (AnalysisWorkLimitException error) when (ReferenceEquals(error.Budget, budget))

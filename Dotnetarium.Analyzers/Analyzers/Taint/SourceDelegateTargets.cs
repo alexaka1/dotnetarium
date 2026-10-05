@@ -5,6 +5,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using Analyzer.Utilities;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
@@ -45,7 +46,8 @@ namespace Dotnetarium.Analyzers.Taint
                         BaseMethodDeclarationSyntax declaration => model.GetDeclaredSymbol(declaration) as IMethodSymbol,
                         LocalFunctionStatementSyntax local => model.GetDeclaredSymbol(local) as IMethodSymbol,
                         AnonymousFunctionExpressionSyntax lambda => (model.GetOperation(lambda) as IAnonymousFunctionOperation)?.Symbol,
-                        IdentifierNameSyntax or GenericNameSyntax or MemberAccessExpressionSyntax or MemberBindingExpressionSyntax =>
+                        IdentifierNameSyntax or GenericNameSyntax or MemberAccessExpressionSyntax or MemberBindingExpressionSyntax
+                            when IsPossibleMethodGroup(node) =>
                             model.GetSymbolInfo(node).Symbol as IMethodSymbol,
                         _ => null
                     };
@@ -56,8 +58,20 @@ namespace Dotnetarium.Analyzers.Taint
             return found.ToImmutableArray();
         }
 
+        private static bool IsPossibleMethodGroup(SyntaxNode node)
+        {
+            // Invoked metadata methods are not delegate targets merely because
+            // their signature matches. Source declarations are indexed separately.
+            // Inspect complete member expressions rather than their name children.
+            if (node.Parent is InvocationExpressionSyntax call && call.Expression == node) return false;
+            return node.Parent is not (MemberAccessExpressionSyntax or MemberBindingExpressionSyntax or
+                QualifiedNameSyntax or AliasQualifiedNameSyntax or TypeArgumentListSyntax or
+                VariableDeclarationSyntax or ParameterSyntax);
+        }
+
         private bool Compatible(IMethodSymbol candidate, IMethodSymbol invoke)
         {
+            AnalysisWorkBudget.VisitOperation();
             if (candidate.ReturnsVoid != invoke.ReturnsVoid) return false;
             if (!candidate.ReturnsVoid && !MayConvert(candidate.ReturnType, invoke.ReturnType)) return false;
             // Optional/params adaptation and generic inference can introduce thunks.

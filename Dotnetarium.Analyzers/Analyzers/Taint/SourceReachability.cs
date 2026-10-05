@@ -24,6 +24,8 @@ namespace Dotnetarium.Analyzers.Taint
         private readonly TaintedDataSymbolMap<SourceInfo> sources;
         private readonly ConcurrentDictionary<ControlFlowGraph, bool> results = new();
         private readonly ConcurrentDictionary<IMethodSymbol, bool> sourceFreeMethods = new(SymbolEqualityComparer.Default);
+        private readonly ConcurrentDictionary<INamedTypeSymbol, ImmutableArray<SourceInfo>> sourceTypes = new(SymbolEqualityComparer.Default);
+        private readonly ConcurrentDictionary<IParameterSymbol, bool> sourceParameters = new(SymbolEqualityComparer.Default);
 
         internal SourceReachability(Compilation compilation, TaintedDataSymbolMap<SourceInfo> sources)
         {
@@ -44,25 +46,31 @@ namespace Dotnetarium.Analyzers.Taint
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var graph = pending.Dequeue();
+                if (results.TryGetValue(graph, out var cached))
+                {
+                    if (cached) return true;
+                    continue;
+                }
                 var summary = Summaries.GetValue(graph, Summarize);
-                if (summary.Unknown) return true;
+                if (summary.Unknown) return RememberPossibleSource(graph);
                 foreach (var (operation, operationGraph) in summary.Operations)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    AnalysisWorkBudget.VisitOperation();
                     switch (operation)
                     {
                         case IPropertyReferenceOperation property when sources.IsSourceProperty(property):
                         case IFieldReferenceOperation field when sources.IsSourceField(field):
-                        case IParameterReferenceOperation parameter when sources.IsSourceParameter(parameter.Parameter, types):
+                        case IParameterReferenceOperation parameter when IsSourceParameter(parameter.Parameter):
                         case IArrayCreationOperation { Type: IArrayTypeSymbol arrayType, Initializer: { } initializer }
                             when sources.IsSourceConstantArrayOfType(arrayType, initializer):
-                            return true;
+                            return RememberPossibleSource(graph);
                     }
 
                     foreach (var (method, receiver, arguments) in Calls(operation))
                     {
                         var argumentsKnown = operation is IInvocationOperation or IObjectCreationOperation;
-                        if (IsSourceMethod(method, arguments, argumentsKnown)) return true;
+                        if (IsSourceMethod(method, arguments, argumentsKnown)) return RememberPossibleSource(graph);
                         var targets = new List<IMethodSymbol> { method };
                         if (method.MethodKind == MethodKind.DelegateInvoke)
                             targets.AddRange(SourceDelegateTargets.GetOrCreate(compilation).GetTargets(method));
@@ -73,8 +81,8 @@ namespace Dotnetarium.Analyzers.Taint
                             targets.AddRange(SourceInterfaceImplementationMap.GetOrCreate(compilation).GetVirtualTargets(method));
                         foreach (var target in targets)
                         {
-                            if (IsSourceMethod(target, arguments, argumentsKnown) || target.Parameters.Any(parameter => sources.IsSourceParameter(parameter, types)))
-                                return true;
+                            if (IsSourceMethod(target, arguments, argumentsKnown) || target.Parameters.Any(IsSourceParameter))
+                                return RememberPossibleSource(graph);
                             var definition = (target.ReducedFrom ?? target).OriginalDefinition;
                             if (!visited.Add(definition) || sourceFreeMethods.ContainsKey(definition)) continue;
                             if (visited.Count > MethodBudget) return true;
@@ -111,8 +119,17 @@ namespace Dotnetarium.Analyzers.Taint
             return false;
         }
 
+        private bool RememberPossibleSource(ControlFlowGraph graph)
+        {
+            results.TryAdd(graph, true);
+            return true;
+        }
+
+        private bool IsSourceParameter(IParameterSymbol parameter) =>
+            sourceParameters.GetOrAdd(parameter, candidate => sources.IsSourceParameter(candidate, types));
+
         private bool IsSourceMethod(IMethodSymbol method, ImmutableArray<IArgumentOperation> arguments, bool argumentsKnown) =>
-            sources.GetInfosForType(method.ContainingType).Any(info =>
+            sourceTypes.GetOrAdd(method.ContainingType, candidate => sources.GetInfosForType(candidate).ToImmutableArray()).Any(info =>
                 info.TaintedMethods.Any(model => !argumentsKnown || model.Item1(method.Name, arguments)) ||
                 info.TaintedMethodsNeedsPointsToAnalysis.Any(model => !argumentsKnown || model.Item1(method.Name, arguments)) ||
                 info.TaintedMethodsNeedsValueContentAnalysis.Any(model => !argumentsKnown || model.Item1(method.Name, arguments)));
@@ -180,6 +197,7 @@ namespace Dotnetarium.Analyzers.Taint
                 foreach (var function in graph.LocalFunctions) pending.Enqueue(graph.GetLocalFunctionControlFlowGraph(function));
                 foreach (var operation in graph.DescendantOperations())
                 {
+                    AnalysisWorkBudget.VisitOperation();
                     operations.Add((operation, graph));
                     if (operation is IFlowAnonymousFunctionOperation lambda) pending.Enqueue(graph.GetAnonymousFunctionControlFlowGraph(lambda));
                     if (operation is IInvalidOperation or IDynamicInvocationOperation or IDynamicObjectCreationOperation or

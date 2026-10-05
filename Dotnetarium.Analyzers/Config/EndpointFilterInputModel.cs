@@ -21,6 +21,7 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var syntax in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (InvocationSyntax.Name(syntax.Expression) is not ("AddEndpointFilter" or "AddEndpointFilterFactory")) continue;
                     if (model.GetOperation(syntax) is not IInvocationOperation filter ||
                         filter.TargetMethod.ContainingType.ToDisplayString() != "Microsoft.AspNetCore.Http.EndpointFilterExtensions" ||
                         filter.TargetMethod.Name is not ("AddEndpointFilter" or "AddEndpointFilterFactory")) continue;

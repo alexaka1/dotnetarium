@@ -1,4 +1,5 @@
 using System.Security.Cryptography;
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.CodeAnalysis;
@@ -12,7 +13,7 @@ namespace Dotnetarium.Tool;
 internal sealed class CompilationInputInventory(string target, bool direct, ScanSelection selection)
 {
     private readonly string root = Path.GetDirectoryName(target)!;
-    private readonly List<object> projects = [];
+    private readonly ConcurrentDictionary<ProjectId, object> projects = new();
 
     internal async Task CaptureAsync(Project project, Compilation compilation, AnalyzerOptions options, ScanInputs inputs)
     {
@@ -65,7 +66,7 @@ internal sealed class CompilationInputInventory(string target, bool direct, Scan
             };
         }).OrderBy(reference => reference.identity, StringComparer.Ordinal).ThenBy(reference => reference.path, StringComparer.Ordinal).ToArray();
         var settings = compilation.Options as CSharpCompilationOptions;
-        projects.Add(new
+        projects[project.Id] = new
         {
             path = Relative(project.FilePath ?? ""),
             name = project.Name,
@@ -112,7 +113,7 @@ internal sealed class CompilationInputInventory(string target, bool direct, Scan
             {
                 path = Relative(reference.FullPath ?? ""), display = reference.Display
             }).OrderBy(reference => reference.path, StringComparer.Ordinal).ToArray()
-        });
+        };
     }
 
     internal async Task WriteAsync(string path, ScanReport report, ScanInputs inputs)
@@ -126,7 +127,7 @@ internal sealed class CompilationInputInventory(string target, bool direct, Scan
             target = Relative(target),
             loadingMode = direct ? "direct" : "project",
             selection = new { configuration = selection.Configuration, framework = selection.Framework },
-            projects,
+            projects = inputs.Projects.Where(project => projects.ContainsKey(project.Id)).Select(project => projects[project.Id]).ToArray(),
             // Dependency evidence survives even if a project has no usable
             // compilation. This snapshot does not perform an advisory lookup.
             restoreInputs = inputs.RestoredAssets.Select(pair => new
@@ -137,9 +138,11 @@ internal sealed class CompilationInputInventory(string target, bool direct, Scan
                 advisoryCheck = "not-performed",
                 packageInventory = inputs.PackageInventories.GetValueOrDefault(pair.Key)
             }).OrderBy(input => input.project, StringComparer.Ordinal).ThenBy(input => input.targetFramework, StringComparer.Ordinal).ToArray(),
-            analyzedProjects = report.AnalyzedProjects,
-            skippedProjects = report.SkippedProjects,
-            notices = report.Notices.Distinct().Select(notice => new { id = notice.Id, message = notice.Message, isFailure = notice.IsFailure })
+            analyzedProjects = report.AnalyzedProjects.Order(StringComparer.Ordinal).ToArray(),
+            skippedProjects = report.SkippedProjects.Distinct().Order(StringComparer.Ordinal).ToArray(),
+            notices = report.Notices.Distinct().OrderBy(notice => notice.Id, StringComparer.Ordinal)
+                .ThenBy(notice => notice.Message, StringComparer.Ordinal)
+                .Select(notice => new { id = notice.Id, message = notice.Message, isFailure = notice.IsFailure })
         }, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
     }
 

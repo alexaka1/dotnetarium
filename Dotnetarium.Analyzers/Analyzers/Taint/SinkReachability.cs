@@ -5,6 +5,7 @@ using System.Collections.Immutable;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using Analyzer.Utilities;
 using Analyzer.Utilities.Extensions;
 using Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis;
 using Microsoft.CodeAnalysis;
@@ -44,11 +45,18 @@ namespace Dotnetarium.Analyzers.Taint
             while (pending.Count > 0)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var summary = Summaries.GetValue(pending.Dequeue(), graph => Summarize(graph, cancellationToken));
-                if (summary.Unknown || summary.Members.Any(IsSinkMember)) return true;
+                var graph = pending.Dequeue();
+                if (results.TryGetValue(graph, out var cached))
+                {
+                    if (cached) return true;
+                    continue;
+                }
+                var summary = Summaries.GetValue(graph, current => Summarize(current, cancellationToken));
+                if (summary.Unknown || summary.Members.Any(IsSinkMember)) return RememberPossibleSink(graph);
                 foreach (var call in summary.Methods)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    AnalysisWorkBudget.VisitOperation();
                     var method = call.Method;
                     var targets = new List<IMethodSymbol> { method };
                     if (method.ContainingType.TypeKind == TypeKind.Interface)
@@ -57,7 +65,7 @@ namespace Dotnetarium.Analyzers.Taint
                         targets.AddRange(SourceInterfaceImplementationMap.GetOrCreate(compilation).GetVirtualTargets(method));
                     foreach (var target in targets)
                     {
-                        if (IsSinkMethod(target)) return true;
+                        if (IsSinkMethod(target)) return RememberPossibleSink(graph);
                         var definition = (target.ReducedFrom ?? target).OriginalDefinition;
                         if (!visited.Add(definition) || sinkFreeMethods.ContainsKey(definition)) continue;
                         if (visited.Count > ProofMethodBudget) return true;
@@ -82,6 +90,12 @@ namespace Dotnetarium.Analyzers.Taint
             // a back edge alone must never establish that a recursive method is safe.
             foreach (var method in visited) sinkFreeMethods.TryAdd(method, true);
             return false;
+        }
+
+        private bool RememberPossibleSink(ControlFlowGraph graph)
+        {
+            results.TryAdd(graph, true);
+            return true;
         }
 
         private ImmutableArray<SinkInfo> SinkInfos(INamedTypeSymbol type) =>
@@ -118,6 +132,7 @@ namespace Dotnetarium.Analyzers.Taint
                 foreach (var operation in graph.DescendantOperations())
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    AnalysisWorkBudget.VisitOperation();
                     switch (operation)
                     {
                         case IInvocationOperation call: AddMethod(call.TargetMethod, call.Instance); break;

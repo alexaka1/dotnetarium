@@ -21,10 +21,12 @@ namespace Dotnetarium.Config
                 var model = compilation.GetSemanticModel(tree);
                 foreach (var syntax in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
                 {
+                    if (InvocationSyntax.Name(syntax.Expression) is not ("AddConsumer" or "ConfigureConsumer" or "Consumer")) continue;
                     if (model.GetOperation(syntax) is not IInvocationOperation call ||
                         call.TargetMethod.ContainingNamespace.ToDisplayString() != "MassTransit" ||
                         call.TargetMethod.Name is not ("AddConsumer" or "ConfigureConsumer" or "Consumer")) continue;
                     bool busRegistration = syntax.Ancestors().OfType<InvocationExpressionSyntax>().Any(parent =>
+                        InvocationSyntax.Name(parent.Expression) == "AddMassTransit" &&
                         model.GetSymbolInfo(parent).Symbol is IMethodSymbol outer &&
                         outer.ContainingNamespace.ToDisplayString() == "MassTransit" && outer.Name == "AddMassTransit");
                     if (!busRegistration) continue;

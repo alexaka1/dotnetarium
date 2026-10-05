@@ -782,6 +782,71 @@ Work spent on metadata, lookup proofs or waiting for shared caches is not a hard
 wall-clock/memory bound. Recursive summaries remain an accuracy/performance
 improvement to pursue separately; the work budget supplies a practical fallback.
 
+### Cheaper discovery and bounded project concurrency
+
+The subsequent prototype includes source/sink eligibility proof work in the root
+budget, reuses completed eligibility answers, and caches source type/parameter
+lookups. Delegate discovery avoids binding ordinary invocation targets as method
+groups; signature compatibility checks spend work units too. Shared lazy model
+initialization remains outside the budget so an aborted root cannot permanently
+poison a compilation-wide lazy value.
+
+Profiling also found expensive Roslyn binding of EF migration schema calls in
+Minimal API handler discovery. A syntax-name filter now rejects unrelated calls
+before semantic lookup. Matching endpoint calls still require semantic validation;
+extension, static, alias-qualified and conditional-access forms are covered by
+tests. The same prefilter applies to endpoint-filter, messaging registration and
+Blazor render-call discovery. Migration directories are not blanket-excluded:
+custom code can use real sources and sinks. This does not add a SQL sink model
+for `MigrationBuilder.Sql`; that API is not currently modeled. Roslyn's existing
+generated-code policy continues to skip generated taint roots, except the explicit
+Razor handling.
+
+The CLI now scans project compilations concurrently, with a limit of half the
+logical processors, capped at four. Roslyn already analyzes methods concurrently
+within each project. Report and inventory
+collections are thread-safe; output is sorted. More live compilations increase
+memory use. Compiler-error details are limited to the first 20 per compilation,
+with an explicit total-count notice; analyzer failures remain fully reported.
+
+The experimental default budget is reduced from 250,000 to **5,000 units**. This
+is a coverage/runtime tradeoff, not an equivalent complete analysis. A budget
+notice marks the scan partial and deeper paths require a higher configured limit.
+
+Full-solution measurements on Windows, 16 logical processors and approximately
+22 GiB installed RAM, using the experimental direct loader, Release/net10.0:
+
+| Candidate | Full scan | Peak working set | Completed SARIF |
+| --- | --- | --- | --- |
+| Original 250,000-unit default | Stopped at 60.0 s | 1.50 GiB | No |
+| Four projects, 5,000 units, Minimal API prefilter | 57.7 s | 2.27 GiB | Yes |
+| Same with larger projects scheduled first | Stopped at 60.0 s | 2.23 GiB | No |
+| Eight projects, larger projects first | Stopped at 60.0 s | 2.44 GiB | No |
+| Final four projects and framework discovery prefilters | 58.7 s | 2.14 GiB | Yes |
+| Final repeat, no concurrent test workload | 49.5 s | 2.15 GiB | Yes |
+
+The final scan analyzes **27 project compilations**, reports **21 security
+findings**, **1,296–1,317 budget notifications**, and **zero analyzer failures**.
+The two completed final runs have identical finding/flow JSON. Budget notice
+counts can vary because concurrent roots reuse already completed eligibility
+summaries. Input
+reconstruction also has compiler errors/unsupported inputs. It is explicitly a
+partial scan; there is no completed full-budget LANCommander baseline against
+which to claim finding parity. These sub-minute results are
+not a wall-clock guarantee or a Mac benchmark. More project concurrency did not
+improve this workload and was reverted to four.
+
+SharpSaster retains all **41 findings and complete flow/result JSON**, with no
+budget notices at the new default. Existing small test cases preserve their
+expected findings. This validates those fixtures, not deeper LANCommander flows
+cut off by the limit. Further optimization should reduce repeated interprocedural
+work and preserve effects/provenance rather than simply lower the limit again.
+
+All **697 unit tests pass** with the final filters/default. The CLI suite passes
+with the parallel reporting/inventory changes; fresh final-tool CLI checks retain
+real gRPC and generated Razor findings and independent findings after budget
+exhaustion. CI must still validate the pushed changes on Windows and Linux.
+
 ## Next experiment and promotion gates
 
 1. **Complete:** compilation-input inventory and comparison, including resolved
