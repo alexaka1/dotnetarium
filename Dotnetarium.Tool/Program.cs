@@ -80,6 +80,7 @@ internal static class Program
                     .ThenBy(project => project.Name, StringComparer.Ordinal),
                 new ParallelOptions { MaxDegreeOfParallelism = projectConcurrency }, async (project, cancellationToken) =>
             {
+                GeneratorCoverage.Observe(project, report);
                 var compilation = await project.GetCompilationAsync();
                 if (compilation == null)
                 {
@@ -139,9 +140,9 @@ internal static class Program
 
             foreach (var diagnostic in findings)
             {
-                var line = diagnostic.Location.GetLineSpan();
+                var line = SourceLocationSpan.GetDisplaySpan(diagnostic.Location);
                 var path = line.Path;
-                if (!string.IsNullOrEmpty(path))
+                if (!string.IsNullOrEmpty(path) && Path.IsPathRooted(path))
                     path = Path.GetRelativePath(root, path);
                 var cwe = DnaRuleCatalog.TryGetCwe(diagnostic.Id, out var id)
                     ? $" [CWE-{id}]" : string.Empty;

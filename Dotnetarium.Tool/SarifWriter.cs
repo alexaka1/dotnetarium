@@ -176,8 +176,8 @@ internal static class SarifWriter
         if (id.HasValue)
             json.WriteNumber("id", id.Value);
         json.WriteStartObject("physicalLocation");
-        var span = location.GetLineSpan();
-        var relativePath = Path.GetRelativePath(root, span.Path).Replace('\\', '/');
+        var span = SourceLocationSpan.GetDisplaySpan(location);
+        var relativePath = (Path.IsPathRooted(span.Path) ? Path.GetRelativePath(root, span.Path) : span.Path).Replace('\\', '/');
         var uri = string.Join("/", relativePath.Split('/').Select(Uri.EscapeDataString));
         json.WriteStartObject("artifactLocation");
         json.WriteString("uri", uri);
