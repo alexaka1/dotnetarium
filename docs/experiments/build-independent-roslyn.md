@@ -557,6 +557,83 @@ The custom-import fixture separately demonstrates an actual missed finding when
 an imported file is unavailable. These cases argue against silently promoting
 the prototype to the default or treating an automatic fallback as equivalent.
 
+### Sink reachability, receiver bounds and recursive analysis
+
+Isolating each analyzer on LANCommander.SDK (`4a2eef7`, 291 source trees) confirmed
+that seven taint analyzers exceeded a 90-second **profiling harness** budget:
+
+| Rule | Context |
+| --- | --- |
+| DNA0001 | SQL injection |
+| DNA0002 | Command injection |
+| DNA0004 | Path traversal |
+| DNA0006 | LDAP injection |
+| DNA0007 | XPath injection |
+| DNA0011 | SSRF |
+| DNA0021 | XML external entities |
+
+This budget is not a new CLI timeout. A separate, instrumented command-injection
+run stopped at 180 seconds after 32,321 points-to runs and 1,325,633 block visits
+in the recursive JSON `Walk` helper of `ServerConfigurationProvider.RefreshAsync`.
+Completed visits in that helper accounted for approximately 157 seconds excluding
+nested analysis. The context-sensitive recursion guard distinguishes input states,
+so different states can repeatedly expand the same method up to the configured
+call-depth limit. It must not be replaced by a blanket method-symbol cutoff.
+
+The following changes preserve the configured method/local-function depth of five:
+
+* A bounded negative reachability proof skips full taint/points-to analysis only
+  when no configured sink is reachable. Summaries include nested callbacks,
+  source helpers, constructors, properties, operators, lowered cleanup/enumeration,
+  interface candidates and source overrides. Custom sink models participate.
+  Recursive closures are cached as sink-free only after the complete closure is
+  checked. Opaque delegates, dynamic/invalid operations, unavailable source project
+  bodies, missing partial implementations or exhaustion of the 512-method/64-CFG
+  proof budgets preserve normal analysis.
+* Interface fallback candidates must satisfy the receiver's static type bound.
+  Lowered reference conversions and agreeing flow-capture assignments recover
+  erased bounds. Filtering precedes inherited-member resolution; compatible
+  subclasses, variance and possibly compatible open generic definitions remain
+  candidates. Unknown/generic/mixed receivers stay conservative. This eliminates
+  unrelated SDK `IDisposable.Dispose()` bodies from registry/stream cleanup;
+  runtime targets and DI registrations are still selected by the existing engine.
+* Completed recursive points-to calls can reuse a summary at the same call site
+  in the same visitor when input state, arguments, aliases, captures, dependent
+  analyses, exception pass and observed caller-value/flow-capture dependencies
+  agree. No active recursive result is reused, and taint results are not memoized
+  this way. At most 32 snapshots are retained per visitor and are disposed after
+  analysis. This avoids weakening source-to-sink flow reconstruction.
+* Points-to root lookups remain stable while their operation is alive, and requests
+  for the same context serialize computation. Completed result values are weak:
+  consumers can share a live result, and GC can reclaim large unused analysis trees.
+  A strongly retaining prototype reached approximately 8.7 GB working set on this
+  corpus and was rejected. Other dataflow analyses retain their existing root cache.
+
+In isolated, instrumented `RefreshAsync` observations at depth five, completed
+recursive points-to runs fell from 23,328 (956,764 block visits) with reuse disabled
+to 18,726 (768,082 visits) with reuse enabled. Taint runs remained 5,334 in both.
+Elapsed observations were 168.31 and 92.27 seconds, but concurrent workloads differed;
+use the roughly 20% reduction in analysis work, not those times, as the comparison.
+These probes temporarily bypassed the reachability precheck to measure the engine
+cost directly. They are not whole-corpus security scans or controlled benchmarks.
+
+**Tradeoffs and remaining limits:** snapshot comparison/cloning adds CPU and memory
+when states rarely repeat; the cache does not collapse different recursive states
+or remove exponential worst cases. Weak result sharing allows recomputation after
+GC. Open generics, unknown receivers and opaque callbacks can keep unnecessary
+candidate paths alive. Metadata-only methods still have no inspectable body.
+The proof establishes absence of modeled reachable sinks, not program safety;
+neither source/sink model completeness nor general recursive soundness is claimed.
+The direct loader still omits generation and SDK has four compiler errors from
+missing generated bindings. A timed-out full scan remains an incomplete scan.
+
+The 662 unit tests pass, including receiver/generic/cleanup bounds, recursive flow
+and captured/ref/heap writes, changed points-to inputs, root-option separation,
+concurrent sharing and collection/recomputation. A CLI scan with the current weak
+sharing implementation preserves all 41 complete SharpSaster SARIF findings and
+engine flows from the preceding baseline. Large-corpus runtime remains a promotion
+gate until a completed scan and repeatable performance measurements are available.
+
 ## Next experiment and promotion gates
 
 1. **Complete:** compilation-input inventory and comparison, including resolved

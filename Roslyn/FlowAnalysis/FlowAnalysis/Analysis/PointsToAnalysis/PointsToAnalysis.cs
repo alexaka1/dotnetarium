@@ -19,6 +19,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow.PointsToAnalysis
     public partial class PointsToAnalysis : ForwardDataFlowAnalysis<PointsToAnalysisData, PointsToAnalysisContext, PointsToAnalysisResult, PointsToBlockAnalysisResult, PointsToAbstractValue>
     {
         internal static readonly AbstractValueDomain<PointsToAbstractValue> ValueDomainInstance = PointsToAbstractValueDomain.Default;
+        protected override bool ShareActiveRootResults => true;
 
         private PointsToAnalysis(PointsToAnalysisDomain analysisDomain, PointsToDataFlowOperationVisitor operationVisitor)
             : base(analysisDomain, operationVisitor)

@@ -75,6 +75,9 @@ namespace Dotnetarium.Analyzers.Taint
             if (graph == null)
                 return;
 
+            if (!settings.TaintConfiguration.GetSinkReachability(kind).MayReachSink(graph, block.CancellationToken))
+                return;
+
             AnalyzeGraph(graph, block.OwningSymbol);
 
             void AnalyzeGraph(Microsoft.CodeAnalysis.FlowAnalysis.ControlFlowGraph currentGraph, ISymbol owner)

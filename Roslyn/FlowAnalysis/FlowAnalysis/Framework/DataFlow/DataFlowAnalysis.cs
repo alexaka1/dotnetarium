@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using Analyzer.Utilities;
 using Analyzer.Utilities.Extensions;
 using Analyzer.Utilities.PooledObjects;
@@ -22,6 +23,10 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
     {
         private static readonly BoundedCache<IOperation, SingleThreadedConcurrentDictionary<TAnalysisContext, TAnalysisResult>> s_resultCache =
             new();
+        // Keep the lookup stable across rules, but allow large completed trees to
+        // be collected once no caller uses them. Only points-to opts into this.
+        private static readonly ConditionalWeakTable<IOperation, SharedWeakAnalysisCache<TAnalysisContext, TAnalysisResult>> s_sharedRootCache = new();
+        protected virtual bool ShareActiveRootResults => false;
 
         protected DataFlowAnalysis(AbstractAnalysisDomain<TAnalysisData> analysisDomain, DataFlowOperationVisitor<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue> operationVisitor)
         {
@@ -45,6 +50,9 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                 return Run(analysisContext);
             }
 
+            if (ShareActiveRootResults)
+                return s_sharedRootCache.GetValue(analysisContext.ControlFlowGraph.OriginalOperation, _ => new())
+                    .GetOrCompute(analysisContext, context => Run(context));
             var analysisResultsMap = s_resultCache.GetOrCreateValue(analysisContext.ControlFlowGraph.OriginalOperation);
             return analysisResultsMap.GetOrAdd(analysisContext, _ => Run(analysisContext));
         }
@@ -169,6 +177,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
             }
             finally
             {
+                OperationVisitor.ClearCompletedInvocations();
                 catchBlockInputDataMap.Values.Dispose();
                 catchBlockInputDataMap.Dispose();
                 inputDataFromInfeasibleBranchesMap.Values.Dispose();

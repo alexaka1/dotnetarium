@@ -106,6 +106,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\DataFlowAnalysisResult.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\DataFlowAnalysisResultBuilder.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\DataFlowOperationVisitor.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\DataFlowOperationVisitor.CompletedInvocations.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\ForwardDataFlowAnalysis.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\LValueFlowCapturesProvider.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Framework\DataFlow\MapAbstractDomain.cs" />
@@ -124,6 +125,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Extensions\ControlFlowGraphExtensions.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Options\DisposeAnalysisKind.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)SingleThreadedConcurrentDictionary.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)SharedWeakAnalysisCache.cs" />
   </ItemGroup>
   <ItemGroup Condition="'$(ExcludeInternalFlowAnalyses)' != 'true'">
     <Compile Include="$(MSBuildThisFileDirectory)FlowAnalysis\Analysis\TaintedDataAnalysis\FilePathInjectionSinks.cs" />

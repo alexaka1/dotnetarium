@@ -56,6 +56,70 @@ public sealed class InterfaceImplementationMapTests
             SourceInterfaceImplementationMap.GetOrCreate(metadataRoot));
     }
 
+    [Fact]
+    public void Receiver_bound_excludes_unrelated_disposal_but_preserves_compatible_subclasses()
+    {
+        var compilation = Compile("Bounds", """
+            using System;
+            using System.IO;
+            public sealed class Unrelated : IDisposable { public void Dispose() {} }
+            public sealed class ChildStream : MemoryStream, IDisposable { void IDisposable.Dispose() {} }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("System.IDisposable")!.GetMembers("Dispose").Single();
+        var map = SourceInterfaceImplementationMap.GetOrCreate(compilation);
+        Assert.Equal(2, map.GetTargets(member).Length);
+        var bounded = Assert.Single(map.GetTargets(member, compilation.GetTypeByMetadataName("System.IO.MemoryStream")));
+        Assert.Equal("ChildStream", bounded.ContainingType.Name);
+        Assert.Empty(map.GetTargets(member, compilation.GetTypeByMetadataName("System.String")));
+        Assert.Equal(2, map.GetTargets(member, null).Length);
+    }
+
+    [Fact]
+    public void Filters_candidates_before_mapping_an_inherited_implementation()
+    {
+        var compilation = Compile("Inherited", """
+            public interface IService { void Go(); }
+            public class Base : IService { public void Go() {} }
+            public class Derived : Base {}
+            public class Other : IService { public void Go() {} }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IService")!.GetMembers("Go").Single();
+        var target = Assert.Single(SourceInterfaceImplementationMap.GetOrCreate(compilation)
+            .GetTargets(member, compilation.GetTypeByMetadataName("Derived")));
+        Assert.Equal("Base", target.ContainingType.Name);
+    }
+
+    [Fact]
+    public void Preserves_covariant_and_generic_unknown_receiver_candidates()
+    {
+        var compilation = Compile("Variance", """
+            public interface IService { void Go(); }
+            public interface IProducer<out T> { T Get(); }
+            public class Compatible : IService, IProducer<string> { public void Go() {} public string Get() => ""; }
+            public class Other : IService { public void Go() {} }
+            public class Generic<T> where T : IService {}
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IService")!.GetMembers("Go").Single();
+        var map = SourceInterfaceImplementationMap.GetOrCreate(compilation);
+        var bound = compilation.GetTypeByMetadataName("IProducer`1")!.Construct(compilation.GetSpecialType(SpecialType.System_Object));
+        Assert.Equal("Compatible", Assert.Single(map.GetTargets(member, bound)).ContainingType.Name);
+        Assert.Equal(2, map.GetTargets(member, compilation.GetTypeByMetadataName("Generic`1")!.TypeParameters[0]).Length);
+    }
+
+    [Fact]
+    public void Closed_receiver_does_not_exclude_an_open_source_definition()
+    {
+        var compilation = Compile("Generics", """
+            public interface IService { void Go(); }
+            public class Generic<T> : IService { public void Go() {} }
+            public class Other : IService { public void Go() {} }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IService")!.GetMembers("Go").Single();
+        var receiver = compilation.GetTypeByMetadataName("Generic`1")!.Construct(compilation.GetSpecialType(SpecialType.System_Int32));
+        Assert.Equal("Generic", Assert.Single(SourceInterfaceImplementationMap.GetOrCreate(compilation)
+            .GetTargets(member, receiver)).ContainingType.Name);
+    }
+
     private static CSharpCompilation Compile(string name, string source, params MetadataReference[] dependencies)
     {
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)

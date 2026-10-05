@@ -608,7 +608,7 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
                 // injection), the implementation is unknown. Analyze every implementation
                 // visible in this compilation as a possible target.
                 return SourceInterfaceImplementationMap.GetOrCreate(WellKnownTypeProvider.Compilation)
-                    .GetTargets(method);
+                    .GetTargets(method, SourceInterfaceImplementationMap.GetReceiverType(instance, DataFlowAnalysisContext.ControlFlowGraph));
             }
 
             private bool IsConstructorInjectedField(IOperation instance, INamedTypeSymbol serviceType)

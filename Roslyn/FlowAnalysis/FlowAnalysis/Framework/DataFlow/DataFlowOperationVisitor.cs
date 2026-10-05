@@ -23,7 +23,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
     /// <summary>
     /// Operation visitor to flow the abstract dataflow analysis values across a given statement in a basic block.
     /// </summary>
-    public abstract class DataFlowOperationVisitor<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue> : OperationVisitor<object?, TAbstractAnalysisValue>
+    public abstract partial class DataFlowOperationVisitor<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue> : OperationVisitor<object?, TAbstractAnalysisValue>
         where TAnalysisData : AbstractAnalysisData
         where TAnalysisContext : AbstractDataFlowAnalysisContext<TAnalysisData, TAnalysisContext, TAnalysisResult, TAbstractAnalysisValue>
         where TAnalysisResult : class, IDataFlowAnalysisResult<TAbstractAnalysisValue>
@@ -2292,7 +2292,7 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                 else
                 {
                     // Execute interprocedural analysis and get result.
-                    analysisResult = TryGetOrComputeAnalysisResult(interproceduralDataFlowAnalysisContext);
+                    analysisResult = GetOrComputeCompletedInvocation(originalOperation, interproceduralDataFlowAnalysisContext);
                     if (analysisResult == null)
                     {
                         return defaultValue;
@@ -2456,7 +2456,10 @@ namespace Microsoft.CodeAnalysis.FlowAnalysis.DataFlow
                     getCachedAbstractValueFromCaller: GetCachedAbstractValue,
                     getInterproceduralControlFlowGraph: GetInterproceduralControlFlowGraph,
                     getAnalysisEntityForFlowCapture: GetAnalysisEntityForFlowCapture,
-                    getInterproceduralCallStackForOwningSymbol: GetInterproceduralCallStackForOwningSymbol);
+                    getInterproceduralCallStackForOwningSymbol: GetInterproceduralCallStackForOwningSymbol,
+                    cachedCallerValues: ReuseCompletedInvocations && newMethodsBeingAnalyzed.Any(context =>
+                        SymbolEqualityComparer.Default.Equals(context.OwningSymbol.OriginalDefinition, invokedMethod))
+                        ? new Dictionary<IOperation, TAbstractAnalysisValue>() : null);
 
                 // Local functions.
                 (AnalysisEntity?, PointsToAbstractValue)? GetInvocationInstance()

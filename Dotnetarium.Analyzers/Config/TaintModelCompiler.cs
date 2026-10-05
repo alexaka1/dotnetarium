@@ -56,6 +56,7 @@ namespace Dotnetarium.Config
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SourceInfo>> sourceMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SanitizerInfo>> sanitizerMaps = new();
         private readonly ConcurrentDictionary<SinkKind, TaintedDataSymbolMap<SinkInfo>> sinkMaps = new();
+        private readonly ConcurrentDictionary<SinkKind, SinkReachability> sinkReachability = new();
 
         public TaintConfiguration(ConfigData model, Compilation compilation, AnalyzerOptions options)
         {
@@ -78,6 +79,9 @@ namespace Dotnetarium.Config
 
         public TaintedDataSymbolMap<SinkInfo> GetSinkSymbolMap(SinkKind kind) =>
             sinkMaps.GetOrAdd(kind, current => new TaintedDataSymbolMap<SinkInfo>(types, CompileSinks(current)));
+
+        internal SinkReachability GetSinkReachability(SinkKind kind) =>
+            sinkReachability.GetOrAdd(kind, current => new SinkReachability(compilation, GetSinkSymbolMap(current)));
 
         private static bool Applies(HashSet<TaintType> contexts, SinkKind kind) =>
             contexts == null || contexts.Any(context => (int)context == (int)kind);
