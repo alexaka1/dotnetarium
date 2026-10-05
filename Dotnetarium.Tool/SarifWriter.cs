@@ -9,7 +9,7 @@ internal static class SarifWriter
     private const string SourceRootId = "%SRCROOT%";
 
     internal static async Task WriteAsync(string output, string target, IReadOnlyList<Diagnostic> diagnostics,
-        ScanReport? report = null)
+        ScanReport? report = null, string loadingMode = "project")
     {
         var root = Path.GetDirectoryName(Path.GetFullPath(target))!;
         var descriptors = diagnostics.Select(diagnostic => diagnostic.Descriptor)
@@ -33,7 +33,7 @@ internal static class SarifWriter
         json.WriteStartObject();
         WriteTool(json, descriptors);
         WriteSourceRoot(json, root);
-        if (report != null) WriteInvocation(json, report);
+        if (report != null) WriteInvocation(json, report, loadingMode);
         json.WriteStartArray("results");
         foreach (var diagnostic in diagnostics)
             WriteResult(json, diagnostic, root, ruleIndexes[diagnostic.Id]);
@@ -44,13 +44,14 @@ internal static class SarifWriter
         await json.FlushAsync();
     }
 
-    private static void WriteInvocation(Utf8JsonWriter json, ScanReport report)
+    private static void WriteInvocation(Utf8JsonWriter json, ScanReport report, string loadingMode)
     {
         json.WriteStartArray("invocations");
         json.WriteStartObject();
         json.WriteBoolean("executionSuccessful", !report.HasIncompleteAnalysis);
         json.WriteStartObject("properties");
-        json.WriteString("dotnetarium.loadingMode", "project");
+        json.WriteString("dotnetarium.loadingMode", loadingMode);
+        json.WriteBoolean("dotnetarium.experimental", loadingMode == "no-build");
         json.WriteString("dotnetarium.coverage", report.IsPartial ? "partial" : "complete");
         json.WriteStartArray("dotnetarium.analyzedProjects");
         foreach (var project in report.AnalyzedProjects.Order(StringComparer.Ordinal)) json.WriteStringValue(project);

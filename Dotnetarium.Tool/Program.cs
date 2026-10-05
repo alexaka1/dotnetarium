@@ -1,9 +1,7 @@
 using System.Collections.Immutable;
 using System.Collections.Concurrent;
-using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
-using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 using Dotnetarium.Analyzers;
 using Dotnetarium.Config;
@@ -41,27 +39,15 @@ internal static class Program
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
             var report = new ScanReport();
-            var sdkQuery = VisualStudioInstanceQueryOptions.Default;
-            sdkQuery.WorkingDirectory = root;
-            var sdk = MSBuildLocator.QueryVisualStudioInstances(sdkQuery).FirstOrDefault() ??
-                throw new InvalidOperationException("No compatible .NET SDK was found.");
-            MSBuildLocator.RegisterInstance(sdk);
-
-            using var workspace = MSBuildWorkspace.Create();
-            var workspaceErrors = new ConcurrentQueue<WorkspaceDiagnostic>();
-            workspace.RegisterWorkspaceFailedHandler(diagnostic =>
-            {
-                workspaceErrors.Enqueue(diagnostic.Diagnostic);
-            });
-
-            var projects = Path.GetExtension(target).ToLowerInvariant() switch
-            {
-                ".csproj" => new[] { await workspace.OpenProjectAsync(target) },
-                ".sln" or ".slnx" => (await workspace.OpenSolutionAsync(target)).Projects.ToArray(),
-                _ => throw new ArgumentException("Expected a .csproj, .sln, or .slnx path.")
-            };
-            if (!projects.Any(project => project.Language == LanguageNames.CSharp))
-                throw new ArgumentException("The target contains no C# projects.");
+            var selection = new ScanSelection(options.Configuration, options.Framework);
+            Console.WriteLine(options.NoBuild
+                ? "Scan mode: no-build (experimental). Targets, restore and source generators are not run."
+                : "Scan mode: project (default).");
+            using var inputs = options.NoBuild
+                ? await new DirectProjectLoader(report, selection).LoadAsync(target)
+                : await ProjectLoader.LoadProjectAwareAsync(target, report, selection);
+            selection.Apply(inputs, target, report);
+            var projects = inputs.Projects.ToArray();
 
             var analyzerTypes = typeof(DnaRuleCatalog).Assembly.GetTypes()
                 .Where(type => !type.IsAbstract && typeof(DiagnosticAnalyzer).IsAssignableFrom(type) &&
@@ -82,7 +68,8 @@ internal static class Program
             {
                 GeneratorCoverage.Observe(project, report);
                 var compilation = await project.GetCompilationAsync();
-                if (compilation == null)
+                if (compilation == null || !compilation.SyntaxTrees.Any() ||
+                    compilation.GetSpecialType(SpecialType.System_Object).TypeKind == TypeKind.Error)
                 {
                     report.Fail("compilation-load", $"Unable to compile {project.Name}.");
                     report.SkippedProjects.Add(project.Name);
@@ -98,8 +85,11 @@ internal static class Program
                 else if (File.Exists(defaultConfig) && !additionalFiles.Any(file => IsConfigurationFile(file.Path)))
                     additionalFiles = additionalFiles.Add(new FileAdditionalText(defaultConfig));
                 var configOptions = project.AnalyzerOptions.AnalyzerConfigOptionsProvider;
-                if (!configOptions.GlobalOptions.TryGetValue("build_property.IsTestProject", out _))
-                    configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, sdk.MSBuildPath);
+                if (inputs.TestProjectMetadata.TryGetValue(project.Id, out var isTestProject))
+                    configOptions = new ProjectAnalysisOptions(configOptions, isTestProject);
+                else if (!configOptions.GlobalOptions.TryGetValue("build_property.IsTestProject", out _) && inputs.MSBuildPath != null)
+                    configOptions = await ProjectAnalysisOptions.WithTestProjectMetadataAsync(configOptions, project.FilePath!, inputs.MSBuildPath,
+                        selection.Configuration, ScanSelection.FrameworkOf(project));
                 var analyzerOptions = new AnalyzerOptions(additionalFiles, configOptions);
                 var result = await compilation.WithAnalyzers(analyzers, analyzerOptions).GetAllDiagnosticsAsync();
                 report.AnalyzedProjects.Add(project.Name);
@@ -112,16 +102,20 @@ internal static class Program
                 foreach (var notice in result.Where(diagnostic => diagnostic.Id == AnalysisDiagnostics.WorkLimitId))
                     report.Warn("analysis-budget", $"{project.Name}: {notice}");
                 foreach (var error in projectErrors.Take(20))
-                    report.Fail(error.Id == "AD0001" ? "analyzer-failure" : "compiler-error", $"{project.Name}: {error}");
+                    if (options.NoBuild && error.Id != "AD0001")
+                        report.Warn("compiler-error", $"{project.Name}: {error}");
+                    else report.Fail(error.Id == "AD0001" ? "analyzer-failure" : "compiler-error", $"{project.Name}: {error}");
+                // Analyzer failures are fatal even when preceded by many compiler errors.
+                foreach (var error in projectErrors.Skip(20).Where(error => error.Id == "AD0001"))
+                    report.Fail("analyzer-failure", $"{project.Name}: {error}");
                 if (projectErrors.Length > 20)
-                    report.Fail("compiler-error-summary", $"{project.Name}: {projectErrors.Length} compiler/analyzer errors; the first 20 are shown.");
+                    if (options.NoBuild)
+                        report.Warn("compiler-error-summary", $"{project.Name}: {projectErrors.Length} compiler/analyzer errors; the first 20 are shown.");
+                    else report.Fail("compiler-error-summary", $"{project.Name}: {projectErrors.Length} compiler/analyzer errors; the first 20 are shown.");
             });
 
-            foreach (var error in workspaceErrors.DistinctBy(error => (error.Kind, error.Message)))
-                if (error.Kind == WorkspaceDiagnosticKind.Failure)
-                    report.Fail("workspace-error", "Workspace: " + error.Message);
-                else
-                    report.Warn("workspace-warning", "Workspace: " + error.Message);
+            if (report.AnalyzedProjects.Count == 0)
+                report.Fail("no-analysis", "No usable C# projects were analyzed.");
 
             var findings = diagnostics
                 .GroupBy(diagnostic => new
@@ -153,7 +147,7 @@ internal static class Program
                 Console.Error.WriteLine($"{(notice.IsFailure ? "Error" : "Coverage")}: {notice.Message}");
             Console.WriteLine($"{findings.Length} security finding(s){(report.IsPartial ? " (partial scan)" : string.Empty)}; {report.AnalyzedProjects.Count} project compilation(s) analyzed.");
             if (options.SarifPath != null)
-                await SarifWriter.WriteAsync(options.SarifPath, target, findings, report);
+                await SarifWriter.WriteAsync(options.SarifPath, target, findings, report, options.NoBuild ? "no-build" : "project");
             if (report.HasIncompleteAnalysis)
             {
                 Console.Error.WriteLine("Scan incomplete: project/workspace errors or taint work limits occurred; see coverage notices.");
@@ -178,6 +172,9 @@ internal static class Program
         "  --sarif <path>             Write SARIF 2.1.0\n" +
         "  --config <path>            Override dotnetarium.json (version 2.0)\n" +
         "  --fail                     Return 1 when findings are present\n" +
+        "  -nb, --no-build            Experimental: scan without targets, restore or generators\n" +
+        "  --configuration <name>     Select configuration (default: Debug)\n" +
+        "  --framework <net8.0|net10.0> Select root target framework\n" +
         "  -h, --help                 Show this help");
 
     private sealed class FileAdditionalText(string path) : AdditionalText
@@ -193,12 +190,12 @@ internal static class Program
         string.Equals(Path.GetFileName(path), "dotnetarium.json", StringComparison.OrdinalIgnoreCase);
 
     private sealed record Options(string Target, string? SarifPath, string? ConfigPath,
-        bool Fail)
+        bool Fail, bool NoBuild, string? Configuration, string? Framework)
     {
         internal static Options Parse(string[] args)
         {
-            string? target = null, sarif = null, config = null;
-            bool fail = false;
+            string? target = null, sarif = null, config = null, configuration = null, framework = null;
+            bool fail = false, noBuild = false;
             for (int index = 0; index < args.Length; index++)
             {
                 var arg = args[index];
@@ -209,6 +206,9 @@ internal static class Program
                     case "--sarif": sarif = NextValue(); break;
                     case "--config": config = NextValue(); break;
                     case "--fail": fail = true; break;
+                    case "-nb": case "--no-build": noBuild = true; break;
+                    case "--configuration": configuration = NextValue(); break;
+                    case "--framework": framework = NextValue(); break;
                     default:
                         if (arg.StartsWith("-", StringComparison.Ordinal))
                             throw new ArgumentException($"Unknown option {arg}.");
@@ -220,7 +220,11 @@ internal static class Program
             }
             if (target == null) throw new ArgumentException("A project or solution path is required.");
             if (config != null && !File.Exists(config)) throw new ArgumentException($"Configuration not found: {config}");
-            return new Options(target, sarif, config, fail);
+            if (configuration != null && (string.IsNullOrWhiteSpace(configuration) || configuration.StartsWith('-')))
+                throw new ArgumentException("Provide a nonempty configuration name.");
+            if (framework != null && framework is not ("net8.0" or "net10.0"))
+                throw new ArgumentException("--framework must be net8.0 or net10.0.");
+            return new Options(target, sarif, config, fail, noBuild, configuration, framework);
         }
     }
 }
