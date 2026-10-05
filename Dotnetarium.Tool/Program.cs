@@ -38,7 +38,7 @@ internal static class Program
                 throw new FileNotFoundException("Project or solution was not found.", target);
             var root = Path.GetDirectoryName(target)!;
             var defaultConfig = Path.Combine(root, "dotnetarium.json");
-            var report = new ScanReport();
+            var report = new ScanReport(allowTaintCutoffs: options.NoBuild);
             var selection = new ScanSelection(options.Configuration, options.Framework);
             Console.WriteLine(options.NoBuild
                 ? "Scan mode: no-build (experimental). Targets, restore and source generators are not run."
@@ -148,9 +148,9 @@ internal static class Program
             Console.WriteLine($"{findings.Length} security finding(s){(report.IsPartial ? " (partial scan)" : string.Empty)}; {report.AnalyzedProjects.Count} project compilation(s) analyzed.");
             if (options.SarifPath != null)
                 await SarifWriter.WriteAsync(options.SarifPath, target, findings, report, options.NoBuild ? "no-build" : "project");
-            if (report.HasIncompleteAnalysis)
+            if (report.HasExecutionFailures)
             {
-                Console.Error.WriteLine("Scan incomplete: project/workspace errors or taint work limits occurred; see coverage notices.");
+                Console.Error.WriteLine("Scan incomplete: see error and coverage notices.");
                 return 2;
             }
             return options.Fail && findings.Length > 0 ? 1 : 0;

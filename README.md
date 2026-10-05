@@ -34,13 +34,13 @@ dotnetarium MyApp.sln --sarif results.sarif --fail
 dotnetarium MyApp.sln -nb --sarif exploratory.sarif
 ```
 
-The tool accepts `.csproj`, `.sln`, and `.slnx` files. `--sarif` writes SARIF 2.1.0 with relative source paths and available data-flow paths. `--fail` returns exit code 1 when there are findings, which is useful in CI. Without it, findings are printed but do not fail the command. An incomplete scan or invalid input returns exit code 2.
+The tool accepts `.csproj`, `.sln`, and `.slnx` files. `--sarif` writes SARIF 2.1.0 with relative source paths and available data-flow paths. `--fail` returns exit code 1 when there are findings, which is useful in CI. Without it, findings are printed but do not fail the command. Default-mode incomplete scans or invalid input return exit code 2.
 
 The tool selects an installed SDK using the scanned project or solution directory, including its `global.json` if present. Run `dotnetarium --help` for the complete CLI.
 
 **Experimental no-build mode:** `-nb` (or `--no-build`) reads conventional SDK projects directly and runs the same Roslyn security analysis without executing build targets, restoring packages, or running source generators. It continues through compiler errors and reports partial coverage. The default remains project-aware loading. Use `--configuration Release` or `--framework net10.0` to select inputs. See [scan modes](docs/scan-modes.md) for requirements, exit codes and analyzer-package behavior.
 
-Recursive taint analysis has a per-method work limit. A cutoff returns exit code 2 and records partial coverage in SARIF, preserving other findings. EF migrations and model snapshots skip taint analysis; direct hard-coded secret checks remain enabled. See [analysis scope and limits](docs/RuleConfiguration.md#ef-migration-scope).
+Recursive taint analysis has a per-method work limit. A cutoff records partial coverage in SARIF and preserves other findings. Default mode returns exit code 2; `-nb` continues successfully, returning 1 only if `--fail` is set and findings are present. EF migrations and model snapshots skip taint analysis; direct hard-coded secret checks remain enabled. See [analysis scope and limits](docs/RuleConfiguration.md#ef-migration-scope).
 
 ## Configure rules
 

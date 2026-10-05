@@ -24,10 +24,10 @@ class happens to be named `Migration`.
 ## How the main scanner differs
 
 The main tool retains `MSBuildWorkspace`, SDK selection and its existing CLI
-options. It evaluates the target's project/build inputs and loads every target
-framework selected by the workspace. The experiment can reconstruct restored
-inputs without custom MSBuild targets and explicitly select a framework. Those
-experimental loading options are not included in this change.
+options by default. It evaluates the target's project/build inputs and loads
+the target frameworks selected by the workspace. Opt-in `-nb` / `--no-build`
+can reconstruct inputs without custom MSBuild targets; configuration/framework
+selection is available in both modes. See [scan modes](scan-modes.md).
 
 The main tool analyzes a bounded number of project compilations concurrently,
 using half the available processors with a cap of **four**, and starting larger
@@ -38,8 +38,10 @@ console, with a total-count notice; failures remain explicit.
 
 Requested SARIF is now preserved when compilation errors or work cutoffs make a
 scan incomplete. Coverage notices are SARIF invocation notifications, not
-security results or rules. An incomplete analysis returns **2**, including with
-`--fail`. A complete scan with findings returns **1** only with `--fail`.
+security results or rules. Default mode returns **2** for compiler errors or
+cutoffs, including with `--fail`. No-build mode accepts these as partial coverage
+and returns **0**, or **1** when findings are present with `--fail`. Genuine
+analyzer/tool failures still return **2** in both modes.
 
 ## LANCommander measurement
 
