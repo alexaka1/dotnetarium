@@ -634,6 +634,16 @@ sharing implementation preserves all 41 complete SharpSaster SARIF findings and
 engine flows from the preceding baseline. Large-corpus runtime remains a promotion
 gate until a completed scan and repeatable performance measurements are available.
 
+The final default-rule CLI scan of LANCommander.UI and its source project graph
+still exceeded the 900-second experiment budget. It was stopped at the next budget
+check, after 913 seconds, without a completed SARIF report. Peak process working
+set was approximately 4.7 GiB; a managed stack captured during the run still showed
+interprocedural points-to/taint state merging. This is a partial performance
+improvement, not a resolution of the large-corpus timeout. There is no finding
+total or full-scan parity claim for LANCommander. Further work needs a bounded
+recursive summary/widening design with explicit coverage tradeoffs, rather than
+silently reducing call depth or treating an interrupted scan as clean.
+
 ## Next experiment and promotion gates
 
 1. **Complete:** compilation-input inventory and comparison, including resolved
