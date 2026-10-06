@@ -80,6 +80,21 @@ public static class Importer {
 '@ | Set-Content -LiteralPath (Join-Path $projectRoot 'Models.cs') -Encoding utf8
     & dotnet restore $project --configfile $config --nologo -v quiet
     if ($LASTEXITCODE -ne 0) { throw "Restore failed: $framework" }
+    # The default development budget keeps direct findings and exposes incomplete
+    # cross-component summaries. The full profile below checks the complete fixture.
+    $fastSarif = Join-Path $projectRoot 'fast-compiler.sarif'
+    & dotnet build $project --no-restore --nologo -v quiet "-p:ErrorLog=$fastSarif" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Fast analyzer build failed: $framework" }
+    $fastRun = (Get-Content -Raw -LiteralPath $fastSarif | ConvertFrom-Json).runs[0]
+    if (@($fastRun.results | Where-Object ruleId -eq 'DNA0003').Count -ne 2 -or
+        @($fastRun.results | Where-Object ruleId -eq 'DNA0004').Count -ne 3 -or
+        @($fastRun.results | Where-Object ruleId -eq 'DNA9000').Count -ne 1 -or
+        @($fastRun.results | Where-Object ruleId -eq 'AD0001').Count -ne 0) {
+        throw "Fast markup coverage mismatch: $fastSarif"
+    }
+    $projectConfig = Join-Path $projectRoot 'dotnetarium.json'
+    (Get-Content -Raw -LiteralPath $projectConfig).Replace('"Version":"2.0"', '"Version":"2.0","AnalysisProfile":"full"') |
+        Set-Content -LiteralPath $projectConfig -Encoding utf8
     $compilerSarif = Join-Path $projectRoot 'compiler.sarif'
     & dotnet build $project --no-restore --nologo -v quiet "-p:ErrorLog=$compilerSarif" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Installed analyzer build failed: $framework" }
@@ -119,7 +134,7 @@ public static class Importer {
     if (-not @($brokenRun.invocations[0].toolExecutionNotifications | Where-Object { $_.descriptor.id -eq 'generator-load' }).Count) {
         throw "Missing generator failure coverage notice: $framework"
     }
-    "PASS ${framework}: three HTML and three archive findings, safe controls, mapped Razor flows, generator failure coverage"
+    "PASS ${framework}: fast direct findings/partial summary; full three HTML and three archive findings, safe controls, mapped Razor flows, generator failure coverage"
 }
 "Markup/archive checks passed. Reports: $scratch"
 exit 0
