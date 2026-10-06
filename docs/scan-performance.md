@@ -84,10 +84,12 @@ Profile checks cover configuration precedence, numeric overrides, deep helper
 calls, HTTP binder summaries and Blazor state summaries. All 918 unit tests pass.
 Freshly packed .NET 8/10 analyzer and CLI checks verify the default profiles and
 explicit fast/full/max selection in both loading modes. Generated Razor checks
-retain direct findings with fast and expose its cross-component work cutoff;
-full restores that flow. Completed summaries can let later fast roots recover
-more findings within the same budget; the checks require a coverage notice for
-missing flows rather than a fixed number of misses. No-build exit policy and
+reject unexpected sinks with fast and expose its component-summary work cutoffs;
+full verifies all expected flows. The root computing shared component summaries
+spends that work budget; later roots can reuse completed work. Scheduling can
+change which roots finish, including direct query-input flows in complex
+components. The checks require a coverage notice for missing flows rather than
+a fixed subset of findings. No-build exit policy and
 boundary-precision fixtures pass.
 
 ## Earlier LANCommander full-solution measurement
