@@ -120,6 +120,63 @@ public sealed class InterfaceImplementationMapTests
             .GetTargets(member, receiver)).ContainingType.Name);
     }
 
+    [Theory]
+    [InlineData("T, T", "string, int", "", false)]
+    [InlineData("T, T", "string, string", "", true)]
+    [InlineData("T, int", "string, int", "where T : System.IDisposable", false)]
+    [InlineData("T, int", "System.IO.MemoryStream, int", "where T : System.IDisposable", true)]
+    [InlineData("T, int", "NoDefaultConstructor, int", "where T : new()", false)]
+    [InlineData("T, int", "System.IO.MemoryStream, int", "where T : new()", true)]
+    public void Generic_candidate_requires_a_satisfiable_type_substitution(
+        string arguments, string receiverArguments, string constraints, bool expected)
+    {
+        var compilation = Compile("Substitution", $$"""
+            public interface IBase { void Go(string value); }
+            public interface IDerived<TFirst, TSecond> : IBase {}
+            public class NoDefaultConstructor { public NoDefaultConstructor(int value) {} }
+            public class Candidate<T> : IDerived<{{arguments}}> {{constraints}}
+            { public void Go(string value) {} }
+            public class Holder { public IDerived<{{receiverArguments}}> Value = null!; }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IBase")!.GetMembers("Go").Single();
+        var bound = ((IFieldSymbol)compilation.GetTypeByMetadataName("Holder")!.GetMembers("Value").Single()).Type;
+        var targets = SourceInterfaceImplementationMap.GetOrCreate(compilation).GetTargets(member, bound);
+        Assert.Equal(expected ? 1 : 0, targets.Length);
+    }
+
+    [Fact]
+    public void Failed_interface_branch_does_not_poison_a_compatible_substitution()
+    {
+        var compilation = Compile("Alternatives", """
+            public interface IBase { void Go(string value); }
+            public interface IDerived<TFirst, TSecond> : IBase {}
+            public class Candidate<T> : IDerived<System.Collections.Generic.List<T>, string>, IDerived<T, int>
+            { public void Go(string value) {} }
+            public class Holder { public IDerived<System.Collections.Generic.List<System.IO.MemoryStream>, int> Value = null!; }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IBase")!.GetMembers("Go").Single();
+        var bound = ((IFieldSymbol)compilation.GetTypeByMetadataName("Holder")!.GetMembers("Value").Single()).Type;
+        Assert.Single(SourceInterfaceImplementationMap.GetOrCreate(compilation).GetTargets(member, bound));
+    }
+
+    [Fact]
+    public void User_defined_conversion_is_not_a_runtime_receiver_type()
+    {
+        var compilation = Compile("Conversion", """
+            public interface IService { void Go(); }
+            public class Receiver : IService { public void Go() {} }
+            public class Unrelated : IService
+            {
+                public void Go() {}
+                public static implicit operator Receiver(Unrelated value) => new Receiver();
+            }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IService")!.GetMembers("Go").Single();
+        var targets = SourceInterfaceImplementationMap.GetOrCreate(compilation)
+            .GetTargets(member, compilation.GetTypeByMetadataName("Receiver"));
+        Assert.Equal("Receiver", Assert.Single(targets).ContainingType.Name);
+    }
+
     private static CSharpCompilation Compile(string name, string source, params MetadataReference[] dependencies)
     {
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)

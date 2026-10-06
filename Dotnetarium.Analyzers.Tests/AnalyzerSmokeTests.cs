@@ -394,6 +394,30 @@ public sealed class AnalyzerSmokeTests
         Assert.Single(diagnostics, diagnostic => diagnostic.Id == "DNA0003");
     }
 
+    [Theory]
+    [InlineData("string, int", false)]
+    [InlineData("string, string", true)]
+    public async Task Generic_repeated_parameter_does_not_create_an_impossible_redirect_flow(string receiverArguments, bool reports)
+    {
+        var diagnostics = await AnalyzeAsync($$"""
+            using Microsoft.AspNetCore.Http;
+            using Microsoft.AspNetCore.Mvc;
+            public interface IBase { void Go(string value); }
+            public interface IDerived<TFirst, TSecond> : IBase {}
+            public sealed class Candidate<T> : IDerived<T, T>
+            { public void Go(string value) => Holder.Response.Redirect(value); }
+            public static class Holder { public static HttpResponse Response = null!; }
+            [ApiController]
+            public sealed class Endpoint : ControllerBase
+            {
+                private readonly IDerived<{{receiverArguments}}> receiver;
+                public Endpoint(IDerived<{{receiverArguments}}> receiver) => this.receiver = receiver;
+                public void Go(string input) => receiver.Go(input);
+            }
+            """, new OpenRedirectTaintAnalyzer());
+        Assert.Equal(reports ? 1 : 0, diagnostics.Count(diagnostic => diagnostic.Id == "DNA0005"));
+    }
+
     [Fact]
     public async Task Reports_command_flow_with_engine_witness()
     {
