@@ -86,10 +86,22 @@ public static class Importer {
     & dotnet build $project --no-restore --nologo -v quiet "-p:ErrorLog=$fastSarif" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Fast analyzer build failed: $framework" }
     $fastRun = (Get-Content -Raw -LiteralPath $fastSarif | ConvertFrom-Json).runs[0]
-    if (@($fastRun.results | Where-Object ruleId -eq 'DNA0003').Count -ne 2 -or
+    $fastMarkup = @($fastRun.results | Where-Object ruleId -eq 'DNA0003')
+    $fastNotices = @($fastRun.results | Where-Object ruleId -eq 'DNA9000')
+    # Completed flow summaries can be reused by later roots, so scheduling may
+    # recover the third finding within the same budget. Never require a miss.
+    $fastMessages = @($fastMarkup | ForEach-Object {
+        if ($_.message -is [string]) { $_.message } else { $_.message.text }
+    })
+    if ($fastMarkup.Count -lt 2 -or $fastMarkup.Count -gt 3 -or
+        -not ($fastMessages -match 'Query.BuildRenderTree') -or
+        -not ($fastMessages -match 'NoHtml.BuildRenderTree') -or
+        @($fastMessages | Where-Object { $_ -notmatch '(Query|NoHtml|MarkdownView).BuildRenderTree' }).Count -ne 0 -or
         @($fastRun.results | Where-Object ruleId -eq 'DNA0004').Count -ne 3 -or
-        @($fastRun.results | Where-Object ruleId -eq 'DNA9000').Count -ne 1 -or
+        ($fastMarkup.Count -lt 3 -and $fastNotices.Count -eq 0) -or
+        $fastNotices.Count -gt 1 -or
         @($fastRun.results | Where-Object ruleId -eq 'AD0001').Count -ne 0) {
+        $fastRun.results | ConvertTo-Json -Depth 8 | Write-Output
         throw "Fast markup coverage mismatch: $fastSarif"
     }
     $projectConfig = Join-Path $projectRoot 'dotnetarium.json'
