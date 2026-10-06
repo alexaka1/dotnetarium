@@ -149,6 +149,28 @@ Main already filters incompatible non-generic receivers. PR 27 improves generic 
 
 This filters call targets before interprocedural expansion; it does not replace or alter fast/full/max profiles, work budgets or depth limits. Both the reachability proof and taint engine use this shared receiver filter. Uncertain generic variance and unresolved substitutions remain conservative. Calls to members declared directly on constructed generic interfaces with only open source implementations retain their existing lookup limitation; this review does not broaden that feature.
 
+The final edge-case review also checks mixed invariant/variant occurrences of the same parameter. Once invariant arguments produce a closed substitution, the receiver conversion is checked again to reject impossible covariance/contravariance regardless of argument order. Tests retain compatible conversions and check dependent `IComparable<U>`, `class`, `struct` and `unmanaged` constraints.
+
+### Existing constructed-interface limitation
+
+The fallback index uses exact constructed interface symbols. For an unknown receiver in this example, the member is declared on `IService<string>`, but the only indexed implementation declares `IService<T>`:
+
+```csharp
+interface IService<T> { void Go(string input); }
+class Service<T> : IService<T>
+{
+    public void Go(string input) { /* security-sensitive operation */ }
+}
+class Caller
+{
+    public void Invoke(IService<string> service, string input) => service.Go(input);
+}
+```
+
+The fallback can miss the flow into `Service<T>.Go`, affecting open generic repositories, handlers and services reached through an unknown interface receiver. This is an existing false-negative boundary, not a disposal timeout or an analyzer exception. A closed source implementation such as `Service : IService<string>` is covered. Other dispatch paths may recover the target when concrete receiver or DI information is available; that is not a guarantee for all generic registrations. Tests pin both the open limitation and closed positive control. Members inherited from a non-generic base interface are the generic receiver scenario improved by PR 27.
+
+Final verification passes all 981 unit tests in Release, the configuration used by CI and published packages. A final isolated Server fast-profile check retains the same 11 findings and 60 cutoffs with zero analyzer exceptions. Debug testing exposes three existing LINQ callback argument-count assertions in `DataFlowOperationVisitor.GetArgumentValues`; the same three failures reproduce with unchanged main's dispatch implementation. This separate Debug assertion debt is not repaired by the interface filter.
+
 The paired LANCommander runs below use the same harness, inputs and explicit profiles. Services uses SDK-loaded inputs; Server uses reconstructed inputs. Timings exclude loading and compilation. Separate processes, ordinary runtime variation and concurrent machine load affect comparisons, so small differences are not evidence of a general speedup. Main is commit `5f4012b`; review includes PR 27 plus the supplemental fixes.
 
 | Input / implementation | Analysis seconds | Findings | Root cutoffs | Peak GiB |

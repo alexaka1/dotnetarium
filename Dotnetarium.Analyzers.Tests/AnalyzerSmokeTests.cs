@@ -418,6 +418,33 @@ public sealed class AnalyzerSmokeTests
         Assert.Equal(reports ? 1 : 0, diagnostics.Count(diagnostic => diagnostic.Id == "DNA0005"));
     }
 
+    [Theory]
+    [InlineData("out TFirst, TSecond", "string, object", false)]
+    [InlineData("out TFirst, TSecond", "object, string", true)]
+    [InlineData("TFirst, in TSecond", "string, object", false)]
+    [InlineData("TFirst, in TSecond", "object, string", true)]
+    public async Task Mixed_generic_variance_preserves_only_possible_redirect_flows(
+        string parameters, string receiverArguments, bool reports)
+    {
+        var diagnostics = await AnalyzeAsync($$"""
+            using Microsoft.AspNetCore.Http;
+            using Microsoft.AspNetCore.Mvc;
+            public interface IBase { void Go(string value); }
+            public interface IDerived<{{parameters}}> : IBase {}
+            public sealed class Candidate<T> : IDerived<T, T>
+            { public void Go(string value) => Holder.Response.Redirect(value); }
+            public static class Holder { public static HttpResponse Response = null!; }
+            [ApiController]
+            public sealed class Endpoint : ControllerBase
+            {
+                private readonly IDerived<{{receiverArguments}}> receiver;
+                public Endpoint(IDerived<{{receiverArguments}}> receiver) => this.receiver = receiver;
+                public void Go(string input) => receiver.Go(input);
+            }
+            """, new OpenRedirectTaintAnalyzer());
+        Assert.Equal(reports ? 1 : 0, diagnostics.Count(diagnostic => diagnostic.Id == "DNA0005"));
+    }
+
     [Fact]
     public async Task Reports_command_flow_with_engine_witness()
     {

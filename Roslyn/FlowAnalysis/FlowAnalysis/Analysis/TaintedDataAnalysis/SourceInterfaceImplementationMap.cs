@@ -244,6 +244,16 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
             var branch = new Dictionary<ITypeParameterSymbol, ITypeSymbol>(bindings, SymbolEqualityComparer.Default);
             if (!CanMatchType(from, to, variance, branch) ||
                 !branch.All(binding => SatisfiesConstraints(binding.Key, binding.Value, branch))) return false;
+            // An invariant argument can bind a parameter after another occurrence
+            // was accepted conservatively under variance. Recheck the closed pair
+            // so argument order cannot admit an impossible runtime conversion.
+            if (branch.Count > 0)
+            {
+                var substitutedFrom = Substitute(from, branch);
+                var substitutedTo = Substitute(to, branch);
+                if (!ContainsTypeParameter(substitutedFrom) && !ContainsTypeParameter(substitutedTo) &&
+                    !CanMatchType(substitutedFrom, substitutedTo, variance, branch)) return false;
+            }
             foreach (var binding in branch) bindings[binding.Key] = binding.Value;
             return true;
         }

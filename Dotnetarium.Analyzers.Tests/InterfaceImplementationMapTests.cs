@@ -177,6 +177,71 @@ public sealed class InterfaceImplementationMapTests
         Assert.Equal("Receiver", Assert.Single(targets).ContainingType.Name);
     }
 
+    [Theory]
+    [InlineData("out TFirst, TSecond", "string, object", false)]
+    [InlineData("out TFirst, TSecond", "object, string", true)]
+    [InlineData("TFirst, out TSecond", "object, string", false)]
+    [InlineData("TFirst, out TSecond", "string, object", true)]
+    [InlineData("in TFirst, TSecond", "object, string", false)]
+    [InlineData("in TFirst, TSecond", "string, object", true)]
+    [InlineData("TFirst, in TSecond", "string, object", false)]
+    [InlineData("TFirst, in TSecond", "object, string", true)]
+    public void Invariant_substitution_also_respects_other_occurrences_with_variance(
+        string parameters, string receiverArguments, bool expected)
+    {
+        var compilation = Compile("MixedVariance", $$"""
+            public interface IBase { void Go(string value); }
+            public interface IDerived<{{parameters}}> : IBase {}
+            public class Candidate<T> : IDerived<T, T> { public void Go(string value) {} }
+            public class Holder { public IDerived<{{receiverArguments}}> Value = null!; }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IBase")!.GetMembers("Go").Single();
+        var bound = ((IFieldSymbol)compilation.GetTypeByMetadataName("Holder")!.GetMembers("Value").Single()).Type;
+        Assert.Equal(expected ? 1 : 0, SourceInterfaceImplementationMap.GetOrCreate(compilation).GetTargets(member, bound).Length);
+    }
+
+    [Theory]
+    [InlineData("string, int", "where T : System.IComparable<U>", false)]
+    [InlineData("string, string", "where T : System.IComparable<U>", true)]
+    [InlineData("int?, string", "where T : struct", false)]
+    [InlineData("int, string", "where T : struct", true)]
+    [InlineData("int, string", "where T : class", false)]
+    [InlineData("string, int", "where T : class", true)]
+    [InlineData("ManagedValue, int", "where T : unmanaged", false)]
+    [InlineData("int, string", "where T : unmanaged", true)]
+    public void Substituted_constraints_preserve_valid_candidates_and_reject_impossible_ones(
+        string receiverArguments, string constraints, bool expected)
+    {
+        var compilation = Compile("DependentConstraints", $$"""
+            public interface IBase { void Go(string value); }
+            public interface IDerived<TFirst, TSecond> : IBase {}
+            public struct ManagedValue { public string Value; }
+            public class Candidate<T, U> : IDerived<T, U> {{constraints}} { public void Go(string value) {} }
+            public class Holder { public IDerived<{{receiverArguments}}> Value = null!; }
+            """);
+        var member = (IMethodSymbol)compilation.GetTypeByMetadataName("IBase")!.GetMembers("Go").Single();
+        var bound = ((IFieldSymbol)compilation.GetTypeByMetadataName("Holder")!.GetMembers("Value").Single()).Type;
+        Assert.Equal(expected ? 1 : 0, SourceInterfaceImplementationMap.GetOrCreate(compilation).GetTargets(member, bound).Length);
+    }
+
+    [Theory]
+    [InlineData("public class Service<T> : IService<T> { public void Go(string value) {} }", 0)]
+    [InlineData("public class Service : IService<string> { public void Go(string value) {} }", 1)]
+    public void Direct_constructed_generic_member_documents_existing_open_implementation_lookup_limit(
+        string implementation, int expected)
+    {
+        var compilation = Compile("ConstructedMember", $$"""
+            public interface IService<T> { void Go(string value); }
+            {{implementation}}
+            """);
+        var receiver = compilation.GetTypeByMetadataName("IService`1")!
+            .Construct(compilation.GetSpecialType(SpecialType.System_String));
+        var member = (IMethodSymbol)receiver.GetMembers("Go").Single();
+        var map = SourceInterfaceImplementationMap.GetOrCreate(compilation);
+        Assert.Equal(expected, map.GetTargets(member).Length);
+        Assert.Equal(expected, map.GetTargets(member, receiver).Length);
+    }
+
     private static CSharpCompilation Compile(string name, string source, params MetadataReference[] dependencies)
     {
         var references = ((string)AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES")!).Split(Path.PathSeparator)
