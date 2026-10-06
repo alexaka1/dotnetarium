@@ -103,9 +103,9 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
         internal ImmutableArray<IMethodSymbol> GetTargets(IMethodSymbol method, ITypeSymbol? receiverType)
         {
             // Static types constrain candidates; they never identify a unique
-            // runtime implementation. Unknown/generic receivers stay conservative.
+            // runtime implementation. Unknown receivers stay conservative.
             if (receiverType == null || receiverType.TypeKind is not
-                    (TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Array))
+                    (TypeKind.Class or TypeKind.Struct or TypeKind.Interface or TypeKind.Array or TypeKind.TypeParameter))
                 return GetTargets(method);
             return _constrainedTargets.GetOrAdd(receiverType, _ =>
                 new ConcurrentDictionary<IMethodSymbol, ImmutableArray<IMethodSymbol>>(SymbolEqualityComparer.Default))
@@ -122,18 +122,107 @@ namespace Analyzer.Utilities.FlowAnalysis.Analysis.TaintedDataAnalysis
                 });
         }
 
-        private bool IsCompatible(INamedTypeSymbol candidate, ITypeSymbol bound)
+        private bool IsCompatible(INamedTypeSymbol type, ITypeSymbol? receiverType)
         {
-            if (_compilation.ClassifyCommonConversion(candidate, bound).IsImplicit) return true;
-            if (!candidate.IsGenericType || bound is not INamedTypeSymbol namedBound) return false;
-            // The source index stores open definitions. Failure to convert Foo<T>
-            // to Foo<int>/IProducer<string> cannot exclude a closed runtime type.
-            if (candidate.AllInterfaces.Any(contract => SymbolEqualityComparer.Default.Equals(
-                    contract.OriginalDefinition, namedBound.OriginalDefinition))) return true;
-            for (var type = candidate; type != null; type = type.BaseType)
-                if (SymbolEqualityComparer.Default.Equals(type.OriginalDefinition, namedBound.OriginalDefinition)) return true;
+            if (receiverType is ITypeParameterSymbol parameter)
+            {
+                return (!parameter.HasValueTypeConstraint || type.IsValueType) &&
+                    parameter.ConstraintTypes.All(constraint => IsCompatible(type, constraint));
+            }
+
+            if (receiverType is not INamedTypeSymbol receiver)
+            {
+                return receiverType == null || _compilation.ClassifyCommonConversion(type, receiverType).IsImplicit;
+            }
+
+            if (_compilation.ClassifyCommonConversion(type, receiver).IsImplicit)
+            {
+                return true;
+            }
+
+            return receiver.TypeKind == TypeKind.Interface
+                ? type.AllInterfaces.Any(implemented => CanMatchType(implemented, receiver, VarianceKind.Out))
+                : CanMatchType(type, receiver, VarianceKind.Out);
+        }
+
+        private bool CanMatchType(ITypeSymbol from, ITypeSymbol to, VarianceKind variance)
+        {
+            if (variance == VarianceKind.In)
+            {
+                return CanMatchType(to, from, VarianceKind.Out);
+            }
+
+            var conversion = _compilation.ClassifyCommonConversion(from, to);
+            if (conversion.IsIdentity ||
+                (variance == VarianceKind.Out && conversion.IsImplicit && conversion.IsReference))
+            {
+                return true;
+            }
+
+            if (!ContainsTypeParameter(from) && !ContainsTypeParameter(to))
+            {
+                return false;
+            }
+
+            if (from is ITypeParameterSymbol fromParameter)
+            {
+                return (!fromParameter.HasValueTypeConstraint || !to.IsReferenceType) &&
+                    (!fromParameter.HasReferenceTypeConstraint || !to.IsValueType);
+            }
+
+            if (to is ITypeParameterSymbol toParameter)
+            {
+                return (!toParameter.HasValueTypeConstraint || !from.IsReferenceType) &&
+                    (!toParameter.HasReferenceTypeConstraint || !from.IsValueType);
+            }
+
+            if (from is IArrayTypeSymbol fromArray && to is IArrayTypeSymbol toArray)
+            {
+                return fromArray.Rank == toArray.Rank &&
+                    CanMatchType(fromArray.ElementType, toArray.ElementType, variance);
+            }
+
+            if (from is INamedTypeSymbol fromNamed && to is INamedTypeSymbol toNamed &&
+                SymbolEqualityComparer.Default.Equals(fromNamed.OriginalDefinition, toNamed.OriginalDefinition))
+            {
+                if (fromNamed.ContainingType != null && toNamed.ContainingType != null &&
+                    !CanMatchType(fromNamed.ContainingType, toNamed.ContainingType, VarianceKind.None))
+                {
+                    return false;
+                }
+
+                for (var index = 0; index < fromNamed.TypeArguments.Length; index++)
+                {
+                    var argumentVariance = variance == VarianceKind.None
+                        ? VarianceKind.None
+                        : fromNamed.OriginalDefinition.TypeParameters[index].Variance;
+                    if (!CanMatchType(fromNamed.TypeArguments[index], toNamed.TypeArguments[index], argumentVariance))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            }
+
+            if (variance == VarianceKind.Out && !from.IsValueType && !to.IsValueType)
+            {
+                return (from is INamedTypeSymbol { BaseType: { } baseType } &&
+                        CanMatchType(baseType, to, variance)) ||
+                    from.AllInterfaces.Any(implemented => CanMatchType(implemented, to, variance));
+            }
+
             return false;
         }
+
+        private static bool ContainsTypeParameter(ITypeSymbol type) => type switch
+        {
+            ITypeParameterSymbol => true,
+            IArrayTypeSymbol array => ContainsTypeParameter(array.ElementType),
+            INamedTypeSymbol named => named.TypeArguments.Any(ContainsTypeParameter) ||
+                (named.ContainingType != null && ContainsTypeParameter(named.ContainingType)),
+            _ => false
+        };
 
         internal static ITypeSymbol? GetReceiverType(IOperation? instance, ControlFlowGraph? graph = null) =>
             ReceiverType(instance, graph, 0);
