@@ -90,13 +90,14 @@ public static class Importer {
     $fastNotices = @($fastRun.results | Where-Object ruleId -eq 'DNA9000')
     # Completed flow summaries can be reused by later roots, so scheduling may
     # recover the third finding within the same budget. Never require a miss.
-    $fastMessages = @($fastMarkup | ForEach-Object {
-        if ($_.message -is [string]) { $_.message } else { $_.message.text }
+    $fastFiles = @($fastMarkup | ForEach-Object {
+        # Compiler ErrorLog uses SARIF v1; use the mapped sink file rather than
+        # the message's source method (Stored for a cross-component flow).
+        [IO.Path]::GetFileName(([uri]$_.locations[0].resultFile.uri).LocalPath)
     })
     if ($fastMarkup.Count -lt 2 -or $fastMarkup.Count -gt 3 -or
-        -not ($fastMessages -match 'Query.BuildRenderTree') -or
-        -not ($fastMessages -match 'NoHtml.BuildRenderTree') -or
-        @($fastMessages | Where-Object { $_ -notmatch '(Query|NoHtml|MarkdownView).BuildRenderTree' }).Count -ne 0 -or
+        'Query.razor' -notin $fastFiles -or 'NoHtml.razor' -notin $fastFiles -or
+        @($fastFiles | Where-Object { $_ -notin @('Query.razor', 'NoHtml.razor', 'MarkdownView.razor') }).Count -ne 0 -or
         @($fastRun.results | Where-Object ruleId -eq 'DNA0004').Count -ne 3 -or
         ($fastMarkup.Count -lt 3 -and $fastNotices.Count -eq 0) -or
         $fastNotices.Count -gt 1 -or
